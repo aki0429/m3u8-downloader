@@ -11,7 +11,7 @@ from m3u8dl.errors import (
     PlaylistError,
 )
 
-__version__ = '1.0.3'
+__version__ = '1.0.4'
 
 __all__ = [
     'BrowserError',

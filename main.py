@@ -173,6 +173,42 @@ def _run_cli_download(argv: list[str]) -> int:
     return 0
 
 
+# `--browser` で指定できるブラウザ名と実行ファイル名の対応 (パスを直接指定することもできる)
+_BROWSER_NAME_MAP = {
+    'chrome': ('chrome.exe',),
+    'edge': ('msedge.exe',),
+    'brave': ('brave.exe',),
+}
+
+
+def _resolve_browser_argument(value: str) -> str | None:
+    """`--browser` の値から使用するブラウザの実行ファイルパスを決める。
+
+    ブラウザ名 (chrome / edge / brave、大文字小文字は問わない) または実行ファイルのパスを受け付ける。
+    名前で指定された場合は、実際に存在する候補パスから該当するものを探して返す。
+
+    Args:
+        value: ブラウザ名または実行ファイルのパス。
+
+    Returns:
+        実行ファイルのパス。該当するブラウザが見つからなければ None。
+    """
+    path = Path(value).expanduser()
+    if path.is_file():
+        return str(path)
+    executable_names = _BROWSER_NAME_MAP.get(value.strip().lower())
+    if executable_names is None:
+        return None
+    # m3u8dl の読み込みはリポジトリルートが sys.path に入った後に行う (ソース実行時のため)
+    from m3u8dl.browser import _browser_candidates
+
+    # _browser_candidates() は探索順の候補を並べるだけで存在確認はしないため、ここで実在するものだけを採る
+    for candidate in _browser_candidates():
+        if os.path.basename(candidate).lower() in executable_names and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def _run_cli_sniff(argv: list[str]) -> int:
     """画面を出さずにブラウザ解析だけを実行し、検出した URL を JSON に書き出す。
 
@@ -192,7 +228,7 @@ def _run_cli_sniff(argv: list[str]) -> int:
 
     index = argv.index('--sniff') + 1
     if index >= len(argv) or argv[index].startswith('--'):
-        print('usage: m3u8dl.exe --sniff <page_url> [--seconds <n>] [--out <json>] [--headed]')
+        print('usage: m3u8dl.exe --sniff <page_url> [--seconds <n>] [--out <json>] [--headed] [--browser <name|path>]')
         return 2
     page_url = argv[index]
     index += 1
@@ -212,6 +248,14 @@ def _run_cli_sniff(argv: list[str]) -> int:
     seconds = float(options.get('--seconds') or 25)
     out_path = Path(options.get('--out') or 'sniff.json')
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 使用するブラウザの指定 (省略時は Chrome → Edge → Brave を自動で試す)
+    browser_path: str | None = None
+    if options.get('--browser'):
+        browser_path = _resolve_browser_argument(options['--browser'])
+        if browser_path is None:
+            print(f'--browser で指定したブラウザが見つかりません: {options["--browser"]}')
+            return 2
 
     # 検出結果を URL で重複排除して蓄積する (同じ URL が何度も来るため)
     detected: dict[str, dict[str, object]] = {}
@@ -245,9 +289,13 @@ def _run_cli_sniff(argv: list[str]) -> int:
     sniffer = BrowserSniffer(
         on_request=on_request,
         on_status=on_status,
+        browser_path=browser_path,
         headless='--headed' not in options,
     )
     report: dict[str, object] = {'page_url': page_url, 'seconds': seconds, 'ok': False}
+    if browser_path is not None:
+        # 指定されたブラウザを報告にも残す (どのブラウザで検証したかの記録)
+        report['requested_browser'] = browser_path
     try:
         sniffer.start(page_url)
         time_module.sleep(seconds)

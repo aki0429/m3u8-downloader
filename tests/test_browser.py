@@ -491,5 +491,31 @@ class TestBrowserLaunchResilience(unittest.TestCase):
         self.assertIn('ブラウザの起動に失敗しました', str(context.exception))
 
 
+class TestBrowserSelectionFromCli(unittest.TestCase):
+    """`--browser` 引数からブラウザを指定できることの検証 (引数の解釈のみ)。"""
+
+    def test_resolves_browser_name_and_path(self) -> None:
+        """ブラウザ名と実行ファイルのパスの両方を受け付けること。"""
+        import main as cli
+
+        # 実行ファイルのパスはそのまま使う
+        executable = str(Path(sys.executable))
+        self.assertEqual(cli._resolve_browser_argument(executable), executable)
+        # 未知の名前は解決できない
+        self.assertIsNone(cli._resolve_browser_argument('netscape'))
+
+        # ブラウザ名は、そのファミリーの実行ファイル名 (chrome.exe / msedge.exe / brave.exe) に解決される
+        resolved_names: list[tuple[str, str]] = []
+        for name in ('chrome', 'edge', 'brave'):
+            resolved = cli._resolve_browser_argument(name)
+            self.assertTrue(resolved is None or os.path.isfile(resolved), f'{name} の解決結果が不正: {resolved}')
+            if resolved is not None:
+                resolved_names.append((name, os.path.basename(resolved).lower()))
+        if not resolved_names:
+            self.skipTest('対応ブラウザが見つからないためスキップ')
+        for name, executable_name in resolved_names:
+            self.assertIn(executable_name, cli._BROWSER_NAME_MAP[name])
+
+
 if __name__ == '__main__':
     unittest.main()

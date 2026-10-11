@@ -71,7 +71,7 @@ py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 - `test_gui_smoke.py` — GUI の起動スモークテスト
 - `test_gui_download_e2e.py` — GUI (DownloaderApp) の「ダウンロード開始」経路から mp4 が完成するまでの検証 (キャンセルも含む)
 - `test_gui_analysis_e2e.py` — GUI の「ブラウザで解析」経路でプレイリストとバリアントが一覧に反映され、停止できることの検証
-- `test_browser.py` — 実ブラウザ (Chrome/Edge) を起動して CDP 解析が動くことの検証 (起動失敗時の診断・フォールバックも含む)
+- `test_browser.py` — 実ブラウザ (Chrome/Edge/Brave) を起動して CDP 解析が動くことの検証 (起動失敗時の診断・フォールバック・`--browser` の解決も含む)
 - `test_console_encoding.py` — コンソールへ出力するソースが cp932 で表せる文字だけで書かれていることの確認
 
 exe の動作確認:
@@ -82,6 +82,9 @@ dist\m3u8dl.exe --selftest "%TEMP%\m3u8dl_selftest.json"
 
 rem 画面を出さずにブラウザ解析だけを実行 (検出した URL を JSON に書き出す)
 dist\m3u8dl.exe --sniff "https://hls-js.netlify.app/demo/" --seconds 20 --out sniff.json
+
+rem 使用するブラウザを指定して解析する (Chrome 以外での動作確認にも使える)
+dist\m3u8dl.exe --sniff "https://hls-js.netlify.app/demo/" --seconds 20 --out sniff_edge.json --browser edge
 
 rem 「ブラウザで解析」が始まらない環境の切り分けレポートを書き出す
 dist\m3u8dl.exe --diagnose "%USERPROFILE%\Desktop\m3u8dl_diagnose.txt"
@@ -98,6 +101,7 @@ dist\m3u8dl.exe --download "https://example.com/playlist.m3u8" "C:\Users\me\Down
 | `--seconds <n>` | 解析する秒数 (既定 25) |
 | `--out <json>` | 結果の JSON の出力先 (既定 `sniff.json`) |
 | `--headed` | ヘッドレスではなく実際にウィンドウを表示して解析する |
+| `--browser <name\|path>` | 使用するブラウザを指定する (`chrome` / `edge` / `brave`、または実行ファイルのパス)。省略時は Chrome → Edge → Brave の順に自動で試す |
 
 `--download` のオプション:
 
@@ -118,7 +122,7 @@ dist\m3u8dl.exe --download "https://example.com/playlist.m3u8" "C:\Users\me\Down
 ```
 m3u8dl/
   gui.py               tkinter GUI (エントリポイント)
-  browser.py           Chrome/Edge を CDP で制御して m3u8 を検出 / Cookie 取得
+  browser.py           Chrome / Edge / Brave を CDP で制御して m3u8 を検出 / Cookie 取得
   websocket_client.py  RFC6455 の WebSocket クライアント (CDP 通信用・自前実装)
   downloader.py        セグメント並列取得・リトライ・復号・結合・ライブ収録
   hls.py               プレイリスト (マスター/メディア) の解析
@@ -145,6 +149,10 @@ INTERFACES.md          モジュール間インターフェース契約
 - ブラウザの起動ログは `%TEMP%\m3u8dl_browser_launch.log` に追記されます (起動引数とブラウザの出力)。
 - Chrome / Edge が**自動更新の適用待ち**の状態だと起動直後に終了することがあります。ツールは起動プロセスが終了しても数秒間デバッグポートの応答を待ち、それでもだめならサンドボックスを無効化した起動も試します。ブラウザを手動で起動して更新を終わらせてから再試行すると確実です。
 - リモートデバッグがポリシーで禁止されている環境では、どのブラウザでも解析はできません。`--diagnose` のポリシー欄を確認し、ブラウザ側の設定 (またはシステム管理者) でリモートデバッグを許可するか、Cookie を貼り付けてのダウンロード機能を使ってください。
+
+### バリアント (画質) の URL が 404 になる
+
+マスタープレイリストに書かれているバリアントの URL 自体が間違っている配信があります (例: 実在しない `mastermaster_video10000k.m3u8` を指している)。この場合はツール側では取得できないため、`--download` のエラーメッセージに出る解決後の URL を確認し、正しい URL を直接指定してください。
 
 ## 制約事項
 

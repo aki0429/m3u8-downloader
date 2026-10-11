@@ -228,7 +228,7 @@ def _run_cli_sniff(argv: list[str]) -> int:
 
     index = argv.index('--sniff') + 1
     if index >= len(argv) or argv[index].startswith('--'):
-        print('usage: m3u8dl.exe --sniff <page_url> [--seconds <n>] [--out <json>] [--headed] [--browser <name|path>]')
+        print('usage: m3u8dl.exe --sniff <page_url> [--seconds <n>] [--out <json>] [--headed] [--no-drive] [--browser <name|path>]')
         return 2
     page_url = argv[index]
     index += 1
@@ -291,6 +291,8 @@ def _run_cli_sniff(argv: list[str]) -> int:
         on_status=on_status,
         browser_path=browser_path,
         headless='--headed' not in options,
+        # ページの再生を自動操作する (--no-drive で切り分け用に無効化できる)
+        drive_playback='--no-drive' not in options,
     )
     report: dict[str, object] = {'page_url': page_url, 'seconds': seconds, 'ok': False}
     if browser_path is not None:

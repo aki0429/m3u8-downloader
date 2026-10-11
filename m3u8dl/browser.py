@@ -59,6 +59,77 @@ _BROWSER_CREATION_FLAGS_FALLBACK = (
     subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 ) if os.name == 'nt' else 0
 
+# ページの再生を自動操作するためのスクリプト (CDP の Runtime.evaluate で各フレームに流し込む)。
+# 「ブラウザを自由に操作できる仕組み (CDP)」を活かし、ページを開いて待つだけでなく
+# 実際に再生を始めさせ、そのときに発生する通信 (プレイリスト・セグメント) を捕まえる。
+# 戻り値はキーと数値だけの JSON (ページ側の文字列をログに流さないため)。
+_PLAY_DRIVE_SCRIPT = """
+(function () {
+    var media = [];
+    try { media = Array.prototype.slice.call(document.querySelectorAll('video, audio')); } catch (e) { media = []; }
+    var played = 0;
+    var paused = true;
+    for (var i = 0; i < media.length; i++) {
+        try {
+            // 音を鳴らさずに再生させる (自動再生の許可を得やすくするため)
+            media[i].muted = true;
+            var promise = media[i].play();
+            if (promise && typeof promise.catch === 'function') { promise.catch(function () {}); }
+            played++;
+        } catch (e) {}
+    }
+    try { paused = media.length > 0 ? !!media[0].paused : true; } catch (e) { paused = true; }
+    // クリック操作でしか再生を始めないプレーヤー向けに、代表的な再生ボタンを試す
+    var selectors = [
+        'button[aria-label*="Play"]', 'button[aria-label*="play"]',
+        'button[aria-label*="\\u518d\\u751f"]', 'button[title*="Play"]', 'button[title*="\\u518d\\u751f"]',
+        '[data-testid*="play"]', '.vjs-big-play-button', '.vjs-play-control',
+        '.jw-display-icon-container', '.play-button', '.playButton',
+        '[class*="play-button"]', '[class*="playButton"]'
+    ];
+    var clicked = 0;
+    var target = null;
+    for (var s = 0; s < selectors.length; s++) {
+        var hits = [];
+        try { hits = Array.prototype.slice.call(document.querySelectorAll(selectors[s])); } catch (e) { hits = []; }
+        for (var h = 0; h < hits.length; h++) {
+            try {
+                // 画面に出ていない (非表示の) 要素は押さない
+                if (hits[h].getClientRects().length === 0) { continue; }
+                hits[h].click();
+                clicked++;
+                if (!target) { target = hits[h]; }
+            } catch (e) {}
+        }
+        if (clicked > 0) { break; }
+    }
+    // 動画要素そのものをクリックして再生するプレーヤーも多いが、再生中のものを押すと
+    // 一時停止してしまうため、止まっているときだけ押す
+    for (var m = 0; m < media.length; m++) {
+        try {
+            if (media[m].paused) { media[m].click(); if (!target) { target = media[m]; } }
+        } catch (e) {}
+    }
+    var result = { media: media.length, played: played, clicked: clicked, paused: paused };
+    // 信頼されたマウス操作 (CDP の Input.dispatchMouseEvent) に使う要素の中心座標
+    try {
+        if (target) {
+            var rect = target.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight && rect.bottom > 0) {
+                result.x = Math.round(rect.left + rect.width / 2);
+                result.y = Math.round(rect.top + rect.height / 2);
+            }
+        }
+    } catch (e) {}
+    return JSON.stringify(result);
+})()
+"""
+
+# 再生の自動操作を試す間隔 (秒) と回数。
+# プレーヤーの初期化やページ内の遅延読み込みを待つ必要があるため、1 回で諦めずに複数回試す。
+_PLAY_DRIVE_INTERVAL_SECONDS = 3.0
+_PLAY_DRIVE_ATTEMPTS = 10
+
 
 def _launch_variants(headless_requested: bool = False) -> list[tuple[str, tuple[str, ...]]]:
     """ブラウザの起動引数のバリエーションを試行順に返す。
@@ -126,6 +197,46 @@ def _classify(url: str) -> str:
         if marker in path:
             return 'segment'
     return 'other'
+
+
+def _summarize_play_drive(result: dict | None) -> str | None:
+    """再生操作の結果を、ログに流せる短い要約へ変換する。
+
+    Args:
+        result: ページが返した結果 (media / played / clicked を持つ辞書)。
+
+    Returns:
+        要約文字列。操作の対象が無かった (すべて 0 の) 場合は None。
+    """
+    if not result:
+        return None
+    media = result.get('media')
+    played = result.get('played')
+    clicked = result.get('clicked')
+    media_count = media if isinstance(media, int) else 0
+    played_count = played if isinstance(played, int) else 0
+    clicked_count = clicked if isinstance(clicked, int) else 0
+    if media_count <= 0 and played_count <= 0 and clicked_count <= 0:
+        # 動画要素も再生ボタンも無いフレームでは報告する意味が無い
+        return None
+    return f'動画 {media_count} / 再生 {played_count} / クリック {clicked_count}'
+
+
+def _evaluate_result_value(result: object) -> object:
+    """`Runtime.evaluate` の応答から、ページが返した値だけを取り出す。
+
+    Args:
+        result: `Runtime.evaluate` の result ({"result": {"type": ..., "value": ...}} 形式)。
+
+    Returns:
+        ページが返した値。形が想定と違う場合は None。
+    """
+    if not isinstance(result, dict):
+        return None
+    inner = result.get('result')
+    if not isinstance(inner, dict):
+        return None
+    return inner.get('value')
 
 
 def _browser_candidates() -> list[str]:
@@ -214,6 +325,7 @@ class BrowserSniffer:
         port: int = 0,
         headless: bool = False,
         keep_open: bool = True,
+        drive_playback: bool = True,
     ) -> None:
         """スニッファを初期化する (ブラウザの起動は `start()` で行う)。
 
@@ -225,6 +337,7 @@ class BrowserSniffer:
             port: リモートデバッグポート。0 なら空きポートを自動確保する。
             headless: True ならヘッドレスモードで起動する。
             keep_open: True なら接続が切れても自動では後始末しない (呼び出し側が stop する)。
+            drive_playback: True ならページの再生を自動操作する (再生ボタンのクリックや play() の実行)。
         """
         self._on_request = on_request
         self._on_status = on_status
@@ -233,6 +346,7 @@ class BrowserSniffer:
         self._port = port
         self._headless = headless
         self._keep_open = keep_open
+        self._drive_playback = drive_playback
 
         # 起動時に解決しておく (実行ファイルが無ければ start() でエラーにする)
         self._resolved_browser_path = browser_path or _find_browser_path()
@@ -255,6 +369,13 @@ class BrowserSniffer:
         self._profile: Path | None = None
         # ブラウザの出力を逃がすログファイル (起動失敗時の原因表示に使う)
         self._launch_log: Path | None = None
+        # 再生の自動操作 (drive) 用の状態。解析中だけ動く daemon スレッドで使う。
+        #   _drive_stop: 自動操作のループを止めるためのイベント (stop() で立てる)
+        #   _drive_thread: 自動操作のスレッド (未起動なら None)
+        #   _playback_reported: 再生を開始できた旨の状態メッセージを既に出したかどうか
+        self._drive_stop = threading.Event()
+        self._drive_thread: threading.Thread | None = None
+        self._playback_reported = False
 
     def start(self, url: str) -> None:
         """ブラウザを起動し、CDP に接続して `url` を開き、解析を開始する。
@@ -451,6 +572,9 @@ class BrowserSniffer:
                 pass
             self.navigate(url)
             self._emit_status(f'ブラウザ解析を開始しました: {url}')
+            # ページを開いて待つだけでは、クリック操作で再生が始まるプレーヤーの通信を捕まえられない。
+            # CDP でページを操作して実際に再生させ、そのときに発生する通信を検出する。
+            self._start_playback_drive()
         except Exception:
             # 途中で失敗したら起動済みのプロセスとソケットを確実に片付ける
             self.stop()
@@ -462,6 +586,13 @@ class BrowserSniffer:
         # (起動失敗の処理中に 2 回呼ばれるため、ログが二重に流れるのを防ぐ)
         was_active = self._running or self._proc is not None or self._ws is not None
         self._running = False
+
+        # 再生の自動操作を止める (待たずに抜けるので、すぐに join できる)
+        self._drive_stop.set()
+        drive_thread = self._drive_thread
+        self._drive_thread = None
+        if drive_thread is not None and drive_thread.is_alive():
+            drive_thread.join(timeout=2.0)
 
         # 受信ループが読んでいるソケットを閉じる (ブロックしない)
         connection = self._ws
@@ -514,6 +645,202 @@ class BrowserSniffer:
             BrowserError: CDP に接続していない、またはコマンドが失敗したとき。
         """
         self._send_command('Page.navigate', {'url': url}, timeout=10.0)
+
+    # ------------------------------------------------------------------
+    # 再生の自動操作 (CDP でページを自由に操作する)
+    # ------------------------------------------------------------------
+    def _start_playback_drive(self) -> None:
+        """ページの再生を自動操作するスレッドを開始する (バックグラウンドで動かす)。
+
+        画面なし (ヘッドレス) でも画面ありでも同じように動く。GUI はこのスレッドが
+        走っている間も固まらないため、利用者は解析の完了を待つだけでよい。
+        """
+        if not self._drive_playback:
+            return
+        if self._drive_thread is not None and self._drive_thread.is_alive():
+            return
+        # 前回の解析で立てた停止要求を解除してから開始する (同じインスタンスを再利用できるようにする)
+        self._drive_stop.clear()
+        self._playback_reported = False
+        thread = threading.Thread(target=self._playback_drive_loop, name='m3u8dl-play-drive', daemon=True)
+        self._drive_thread = thread
+        thread.start()
+
+    def _playback_drive_loop(self) -> None:
+        """再生の自動操作を一定間隔で繰り返す (daemon スレッド)。
+
+        1 回だけだとページの遅延読み込みやプレーヤーの初期化に間に合わないため複数回試す。
+        自動操作の失敗で解析そのものを止めない (取得できた通信だけで結果を出す)。
+        """
+        for _ in range(_PLAY_DRIVE_ATTEMPTS):
+            # 停止要求が来たら待たずに抜ける (stop() からすぐ終われるようにする)
+            if self._drive_stop.wait(_PLAY_DRIVE_INTERVAL_SECONDS):
+                return
+            if not self.is_running():
+                return
+            try:
+                summary = self._drive_playback_once()
+            except Exception:
+                # ページ側の状態によっては操作に失敗するが、解析は続ける
+                continue
+            if summary and not self._playback_reported:
+                self._playback_reported = True
+                self._emit_status(f'ページの再生操作を自動で行いました ({summary})')
+
+    def _drive_playback_once(self) -> str | None:
+        """ページ内のすべてのフレームで再生の開始を試みる (1 回分)。
+
+        メインフレームはそのまま、子フレームは分離された実行コンテキスト
+        (Page.createIsolatedWorld) を作って操作する。iframe の中にプレーヤーがある
+        ページでも再生を始められるようにするため。
+
+        Returns:
+            操作結果の要約 ('動画 1 / 再生 1 / クリック 1' のような文字列)。
+            どのフレームでも結果を取れなかった場合は None。
+        """
+        frame_ids = self._collect_frame_ids()
+        # メインフレーム (フレームツリーの先頭) はそのまま、既定の実行コンテキストで 1 回だけ操作する。
+        # 以降の要素 (0 個以上) が iframe なので、それぞれ分離したコンテキストで操作する。
+        summaries: list[str] = []
+        main_result = self._evaluate_play_drive(None)
+        main_summary = _summarize_play_drive(main_result)
+        if main_summary:
+            summaries.append(main_summary)
+        if main_result is not None:
+            # ページ内の JavaScript からのクリックは「信頼されていない操作」として無視する
+            # プレーヤーがあるため、CDP の入力イベントで本物のクリックも送る。
+            # 止まっているときだけ送る (再生中の動画を押すと一時停止してしまうため)。
+            if main_result.get('paused') is True:
+                self._dispatch_trusted_click(main_result)
+        for frame_id in frame_ids[1:]:
+            context_id = self._create_isolated_world(frame_id)
+            if context_id is None:
+                continue
+            # iframe の中の座標はメインフレームのビューポートと一致しないため、
+            # 子フレームへはスクリプトによる操作だけを行う (本物のクリックは送らない)
+            summary = _summarize_play_drive(self._evaluate_play_drive(context_id))
+            if summary:
+                summaries.append(summary)
+        if not summaries:
+            return None
+        # 同じ要約が並ぶだけなので重複を落とす (メイン + 子フレームの両方で 0 件のときなど)
+        unique = list(dict.fromkeys(summaries))
+        return ' / '.join(unique)
+
+    def _evaluate_play_drive(self, context_id: int | None) -> dict | None:
+        """指定した実行コンテキストで再生操作のスクリプトを実行する。
+
+        Args:
+            context_id: 実行コンテキスト ID。None なら既定 (メインフレーム) を使う。
+
+        Returns:
+            ページが返した結果 (キーと数値のみの辞書)。実行できなかった場合は None。
+        """
+        parameters: dict[str, object] = {'expression': _PLAY_DRIVE_SCRIPT, 'returnByValue': True}
+        if context_id is not None:
+            parameters['contextId'] = context_id
+        try:
+            result = self._send_command('Runtime.evaluate', parameters, timeout=5.0)
+        except BrowserError:
+            # ページ遷移中・フレーム破棄直後などは失敗する。次の試行に任せる。
+            return None
+        payload = _evaluate_result_value(result)
+        if not isinstance(payload, str) or not payload:
+            return None
+        # ページ側が返す JSON を読み取る (壊れた値が返っても解析は止めない)
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
+
+    def _dispatch_trusted_click(self, result: dict) -> None:
+        """CDP の入力イベントで本物のクリックを 1 回送る。
+
+        Args:
+            result: スクリプトが返した結果 (x / y を持つ場合のみ送る)。
+        """
+        x = result.get('x')
+        y = result.get('y')
+        if not isinstance(x, int) or not isinstance(y, int):
+            return
+        # press と release の 2 つを送らないとクリックとして扱われない
+        for event_type in ('mousePressed', 'mouseReleased'):
+            try:
+                self._send_command(
+                    'Input.dispatchMouseEvent',
+                    {
+                        'type': event_type,
+                        'x': x,
+                        'y': y,
+                        'button': 'left',
+                        'clickCount': 1,
+                        'buttons': 1,
+                    },
+                    timeout=5.0,
+                )
+            except BrowserError:
+                # 入力イベントが送れない環境でも、スクリプトによる操作の結果は残す
+                return
+
+    def _create_isolated_world(self, frame_id: str) -> int | None:
+        """フレーム内に操作専用の実行コンテキストを作る。
+
+        Args:
+            frame_id: 対象フレームの ID。
+
+        Returns:
+            実行コンテキスト ID。作れなかった場合は None。
+        """
+        try:
+            result = self._send_command(
+                'Page.createIsolatedWorld',
+                {'frameId': frame_id, 'worldName': 'm3u8dl-drive'},
+                timeout=5.0,
+            )
+        except BrowserError:
+            return None
+        if isinstance(result, dict):
+            context_id = result.get('executionContextId')
+            if isinstance(context_id, int):
+                return context_id
+        return None
+
+    def _collect_frame_ids(self) -> list[str]:
+        """ページ内のフレーム ID をすべて集める (入れ子の iframe も含む)。
+
+        Returns:
+            フレーム ID のリスト (取得できなければ空リスト)。
+        """
+        try:
+            tree = self._send_command('Page.getFrameTree', {}, timeout=5.0)
+        except BrowserError:
+            return []
+        frame_ids: list[str] = []
+
+        def walk(node: object) -> None:
+            """フレームツリーを 1 段ずつ辿って ID を集める。
+
+            Args:
+                node: frameTree のノード (frame と childFrames を持つ辞書)。
+            """
+            if not isinstance(node, dict):
+                return
+            frame = node.get('frame')
+            if isinstance(frame, dict):
+                frame_id = frame.get('id')
+                if isinstance(frame_id, str) and frame_id:
+                    frame_ids.append(frame_id)
+            children = node.get('childFrames')
+            if isinstance(children, list):
+                for child in children:
+                    walk(child)
+
+        if isinstance(tree, dict):
+            walk(tree.get('frameTree'))
+        return frame_ids
 
     def get_cookies(self, url: str | None = None) -> list[dict]:
         """ブラウザの Cookie を取得する。

@@ -55,6 +55,25 @@ segment1.ts
 #EXT-X-ENDLIST
 """
 
+# クリックされるまでプレイリストを取得しないページ (再生ボタンを押して再生するプレーヤーの模擬)。
+# 再生の自動操作 (drive) が無いと通信が発生しないため、drive の効果を実測で切り分けられる。
+CLICK_HTML = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>click to play</title></head>
+<body>
+<p>click the button to start playback</p>
+<button id="play" class="play-button" aria-label="Play video">Play</button>
+<script>
+document.getElementById('play').addEventListener('click', function () {
+  fetch('./test.m3u8')
+    .then(function (response) { return response.text(); })
+    .then(function () { return fetch('./segment0.ts'); });
+});
+</script>
+</body>
+</html>
+"""
+
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     """テスト用の最小 HTTP ハンドラ。"""
@@ -64,6 +83,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split('?', 1)[0]
         if path in ('/', '/index.html'):
             self._send(200, 'text/html; charset=utf-8', INDEX_HTML.encode('utf-8'))
+        elif path == '/click.html':
+            self._send(200, 'text/html; charset=utf-8', CLICK_HTML.encode('utf-8'))
         elif path == '/test.m3u8':
             self._send(200, 'application/vnd.apple.mpegurl', PLAYLIST.encode('utf-8'))
         elif path == '/segment0.ts':
@@ -247,6 +268,85 @@ class TestBrowserSnifferLifecycle(unittest.TestCase):
         self.assertFalse(sniffer.is_running(), 'stop 後も is_running() が True')
         self.assertIsNone(sniffer._proc, 'stop 後もプロセス参照が残っている')
         self.assertFalse(_port_alive(debug_port), 'stop 後もデバッグポートが生きている')
+
+
+class TestPlaybackDriveWithRealBrowser(unittest.TestCase):
+    """再生の自動操作 (drive) を実ブラウザで検証する (ローカル HTTP のみ)。
+
+    「クリックするまで通信しないページ」を使い、drive があるときだけ検出できることを実測する。
+    """
+
+    def _collect(
+        self, page_path: str, drive_playback: bool, wait_seconds: float
+    ) -> tuple[list, list[str]]:
+        """ページを解析し、検出したリクエストと状態メッセージを返す。
+
+        Args:
+            page_path: 開くページのパス (/click.html など)。
+            drive_playback: 再生の自動操作を行うかどうか。
+            wait_seconds: 検出を待つ最大時間 (秒)。
+
+        Returns:
+            (検出したリクエストのリスト, 状態メッセージのリスト)。
+        """
+        server, port = _start_server()
+        base_url = f'http://127.0.0.1:{port}'
+        requests: list = []
+        statuses: list[str] = []
+        lock = threading.Lock()
+
+        def on_request(request: object) -> None:
+            """検出結果をスレッド安全に蓄積する。
+
+            Args:
+                request: SniffedRequest。
+            """
+            with lock:
+                requests.append(request)
+
+        sniffer = BrowserSniffer(
+            on_request=on_request,
+            on_status=statuses.append,
+            headless=True,
+            drive_playback=drive_playback,
+        )
+        try:
+            sniffer.start(f'{base_url}{page_path}')
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                with lock:
+                    found = any(r.kind == 'playlist' and 'test.m3u8' in r.url for r in requests)
+                if found:
+                    break
+                time.sleep(0.2)
+        finally:
+            sniffer.stop()
+            server.shutdown()
+            server.server_close()
+        return requests, statuses
+
+    def test_drive_clicks_play_button_and_detects_playlist(self) -> None:
+        """クリックしないと通信しないページでも、自動操作で再生が始まり検出できること。"""
+        requests, statuses = self._collect('/click.html', drive_playback=True, wait_seconds=40.0)
+
+        urls = [r.url for r in requests]
+        self.assertTrue(
+            any(r.kind == 'playlist' and 'test.m3u8' in r.url for r in requests),
+            f'自動操作で再生が始まらずプレイリストを検出できなかった: {urls}\n状態: {statuses}',
+        )
+        self.assertTrue(
+            any(message.startswith('ページの再生操作を自動で行いました') for message in statuses),
+            f'自動操作の実行が報告されていない: {statuses}',
+        )
+
+    def test_without_drive_click_page_never_loads_playlist(self) -> None:
+        """自動操作を切ると、同じページではプレイリストが検出されないこと (切り分けの対照)。"""
+        requests, _ = self._collect('/click.html', drive_playback=False, wait_seconds=12.0)
+
+        self.assertFalse(
+            any(r.kind == 'playlist' and 'test.m3u8' in r.url for r in requests),
+            f'操作していないのにプレイリストが検出された: {[r.url for r in requests]}',
+        )
 
 
 class TestBrowserFailureDiagnostics(unittest.TestCase):

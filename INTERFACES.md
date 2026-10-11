@@ -175,7 +175,8 @@ class BrowserSniffer:
     def __init__(self, on_request: Callable[[SniffedRequest], None], on_status: Callable[[str], None] | None = None,
                  browser_path: str | None = None, user_data_dir: Path | None = None,
                  port: int = 0,  # 0 = 空きポート自動
-                 headless: bool = False, keep_open: bool = True) -> None
+                 headless: bool = False, keep_open: bool = True,
+                 drive_playback: bool = True) -> None  # True = ページの再生を自動操作する (再生ボタンのクリック / play())
     def start(self, url: str) -> None      # ブラウザ起動 + CDP 接続 + 解析開始（非同期スレッドで受信ループ）
     def stop(self) -> None                 # ブラウザ終了 + ソケット切断
     def is_running(self) -> bool

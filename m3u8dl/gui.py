@@ -190,6 +190,10 @@ class DownloaderApp:
         self.live_var = tk.BooleanVar(value=False)
         # max_segments_var: 最大セグメント数 (空文字は無制限)
         self.max_segments_var = tk.StringVar(value='')
+        # show_browser_var: 解析時にブラウザの画面を表示するか。
+        # 既定は False = 画面を出さずにバックグラウンドで解析する (利用者の作業を邪魔しない)。
+        # 画面を出せば、ログインや年齢確認などページ側の操作が必要なサイトでも手動で対応できる。
+        self.show_browser_var = tk.BooleanVar(value=False)
         # output_var: 保存先ファイルパス
         self.output_var = tk.StringVar(value=str(_default_output_path()))
 
@@ -368,6 +372,12 @@ class DownloaderApp:
         self.max_segments_entry = ttk.Entry(frame, textvariable=self.max_segments_var, width=8)
         self.max_segments_entry.grid(row=3, column=3, sticky='w', padx=(4, 8), pady=6)
 
+        # 解析時にブラウザの画面を表示するか (既定はバックグラウンド = 画面を出さない)
+        self.show_browser_check = ttk.Checkbutton(
+            frame, text='解析中にブラウザの画面を表示 (通常はバックグラウンドで解析します)', variable=self.show_browser_var
+        )
+        self.show_browser_check.grid(row=4, column=0, columnspan=4, sticky='w', padx=8, pady=6)
+
         self.lockable_widgets += [
             self.output_entry,
             self.browse_button,
@@ -377,6 +387,7 @@ class DownloaderApp:
             self.convert_check,
             self.live_check,
             self.max_segments_entry,
+            self.show_browser_check,
         ]
 
         # ffmpeg が無ければ mp4 変換を無効化し、ログで警告する
@@ -542,25 +553,35 @@ class DownloaderApp:
         self.page_url = url
         # ヘッダはメインスレッドで確定させ、ワーカーへスナップショットを渡す
         headers = self._build_headers()
+        # 画面を出すかどうかもここ (メインスレッド) で確定させる。
+        # 既定は False = バックグラウンドで解析し、利用者の作業を邪魔しない。
+        show_window = bool(self.show_browser_var.get())
         self._set_busy(True)
-        self._append_log(f'ブラウザ解析を開始します: {url}')
-        threading.Thread(target=self._run_analysis, args=(url, headers), daemon=True).start()
+        mode = '画面あり' if show_window else 'バックグラウンド'
+        self._append_log(f'ブラウザ解析を開始します ({mode}): {url}')
+        threading.Thread(target=self._run_analysis, args=(url, headers, show_window), daemon=True).start()
 
-    def _run_analysis(self, page_url: str, headers: dict[str, str]) -> None:
+    def _run_analysis(self, page_url: str, headers: dict[str, str], show_window: bool = False) -> None:
         """ブラウザを起動して CDP 解析を開始する (ワーカースレッド)。
 
         Args:
             page_url: 解析対象のページ URL。
             headers: プレイリスト取得に使うヘッダのスナップショット。
+            show_window: True ならブラウザの画面を表示する (False ならバックグラウンドで解析する)。
         """
         try:
             sniffer = BrowserSniffer(  # type: ignore[misc]
                 on_request=lambda request: self.root.after(0, self._on_sniffed_request, request, headers),
                 on_status=lambda message: self.log(message),
+                # 画面を表示しない場合はヘッドレスで動かす (バックグラウンドで解析するため)
+                headless=not show_window,
             )
             self.sniffer = sniffer
             sniffer.start(page_url)
-            self.log('ブラウザ解析を実行中です。ページを操作して動画を再生してください。')
+            if show_window:
+                self.log('ブラウザ解析を実行中です。ページを操作して動画を再生してください。')
+            else:
+                self.log('バックグラウンドでブラウザを動かし、ページの再生を自動で操作して取得内容を解析しています...')
         except Exception as exc:
             # ブラウザを起動できない環境では、ページの内容から URL を直接探して最低限の結果を返す
             self.log('ブラウザで解析できないため、ページの内容から URL を直接探します...')

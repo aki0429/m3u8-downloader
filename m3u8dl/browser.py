@@ -684,8 +684,21 @@ class BrowserSniffer:
                 # ページ側の状態によっては操作に失敗するが、解析は続ける
                 continue
             if summary and not self._playback_reported:
-                self._playback_reported = True
-                self._emit_status(f'ページの再生操作を自動で行いました ({summary})')
+                self._report_play_drive(summary)
+
+    def _report_play_drive(self, summary: str | None) -> None:
+        """再生操作を実行したことを状態メッセージで知らせる (同じ解析では 1 回だけ)。
+
+        操作の直後と、ループの各試行後の両方から呼ばれる。先に知らせた方が勝ち、
+        2 回目以降は何もしない (同じ内容を繰り返しログに出さないため)。
+
+        Args:
+            summary: 操作結果の要約。操作の対象が無かった場合は None。
+        """
+        if not summary or self._playback_reported:
+            return
+        self._playback_reported = True
+        self._emit_status(f'ページの再生操作を自動で行いました ({summary})')
 
     def _drive_playback_once(self) -> str | None:
         """ページ内のすべてのフレームで再生の開始を試みる (1 回分)。
@@ -706,6 +719,10 @@ class BrowserSniffer:
         main_summary = _summarize_play_drive(main_result)
         if main_summary:
             summaries.append(main_summary)
+            # 操作できた時点で即座に知らせる。ここで知らせないと、ページが再生を始めて
+            # 目的の通信が取れた直後に解析を止めた場合 (利用者の「停止」やテストの早期終了)、
+            # この後の iframe 走査を待っている間に知らせ損ねる。
+            self._report_play_drive(main_summary)
         if main_result is not None:
             # ページ内の JavaScript からのクリックは「信頼されていない操作」として無視する
             # プレーヤーがあるため、CDP の入力イベントで本物のクリックも送る。

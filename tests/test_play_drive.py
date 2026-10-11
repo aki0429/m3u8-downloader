@@ -153,6 +153,45 @@ class DrivePlaybackOnceTest(unittest.TestCase):
         # どのフレームでも同じ結果になるため、要約は 1 つに畳まれる
         self.assertEqual(summary, '動画 1 / 再生 1 / クリック 2')
 
+    def test_reports_immediately_when_operation_succeeds(self) -> None:
+        """操作できた時点で通知すること (解析を止めるのが先でも取りこぼさない)。
+
+        通知をループの最後にまとめると、ページが再生を始めて目的の通信が取れた直後に
+        解析を止めた場合 (利用者の「停止」やテストの早期終了)、iframe の走査を待っている
+        間に通知を出し損ねる。
+        """
+        statuses: list[str] = []
+        sniffer = _FakeSniffer(
+            on_status=statuses.append,
+            responses={
+                'Page.getFrameTree': {'frameTree': {'frame': {'id': 'main'}}},
+                'Runtime.evaluate': {'result': {'value': PLAY_DRIVE_RESULT}},
+            },
+        )
+
+        sniffer._drive_playback_once()
+
+        reports = [message for message in statuses if message.startswith('ページの再生操作を自動で行いました')]
+        self.assertEqual(len(reports), 1, f'通知が 1 回ではない: {statuses}')
+
+    def test_reports_only_once_across_attempts(self) -> None:
+        """何度試しても、操作できた旨の通知は 1 回だけであること。"""
+        statuses: list[str] = []
+        sniffer = _FakeSniffer(
+            on_status=statuses.append,
+            responses={
+                'Page.getFrameTree': {'frameTree': {'frame': {'id': 'main'}}},
+                'Runtime.evaluate': {'result': {'value': PLAY_DRIVE_RESULT}},
+            },
+        )
+
+        sniffer._drive_playback_once()
+        sniffer._drive_playback_once()
+        sniffer._drive_playback_once()
+
+        reports = [message for message in statuses if message.startswith('ページの再生操作を自動で行いました')]
+        self.assertEqual(len(reports), 1, f'通知が 1 回ではない: {statuses}')
+
     def test_returns_none_when_page_has_no_media(self) -> None:
         """動画も再生ボタンも無いページでは要約を返さないこと。"""
         sniffer = _FakeSniffer(

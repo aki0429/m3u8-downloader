@@ -277,7 +277,7 @@ class TestPlaybackDriveWithRealBrowser(unittest.TestCase):
     """
 
     def _collect(
-        self, page_path: str, drive_playback: bool, wait_seconds: float
+        self, page_path: str, drive_playback: bool, wait_seconds: float, wait_status: str | None = None
     ) -> tuple[list, list[str]]:
         """ページを解析し、検出したリクエストと状態メッセージを返す。
 
@@ -285,6 +285,7 @@ class TestPlaybackDriveWithRealBrowser(unittest.TestCase):
             page_path: 開くページのパス (/click.html など)。
             drive_playback: 再生の自動操作を行うかどうか。
             wait_seconds: 検出を待つ最大時間 (秒)。
+            wait_status: 指定した接頭辞の状態メッセージが出るまで待つ (None なら待たない)。
 
         Returns:
             (検出したリクエストのリスト, 状態メッセージのリスト)。
@@ -316,7 +317,10 @@ class TestPlaybackDriveWithRealBrowser(unittest.TestCase):
             while time.monotonic() < deadline:
                 with lock:
                     found = any(r.kind == 'playlist' and 'test.m3u8' in r.url for r in requests)
-                if found:
+                # 再生の自動操作の報告も待つ。報告は操作の直後に出るが、
+                # 速く通信が取れた場合に報告を取りこぼさないようにするため。
+                reported = wait_status is None or any(m.startswith(wait_status) for m in statuses)
+                if found and reported:
                     break
                 time.sleep(0.2)
         finally:
@@ -327,7 +331,12 @@ class TestPlaybackDriveWithRealBrowser(unittest.TestCase):
 
     def test_drive_clicks_play_button_and_detects_playlist(self) -> None:
         """クリックしないと通信しないページでも、自動操作で再生が始まり検出できること。"""
-        requests, statuses = self._collect('/click.html', drive_playback=True, wait_seconds=40.0)
+        requests, statuses = self._collect(
+            '/click.html',
+            drive_playback=True,
+            wait_seconds=40.0,
+            wait_status='ページの再生操作を自動で行いました',
+        )
 
         urls = [r.url for r in requests]
         self.assertTrue(

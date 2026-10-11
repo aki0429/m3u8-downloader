@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.server
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -326,6 +327,168 @@ class TestBrowserFailureDiagnostics(unittest.TestCase):
                 sniffer.stop()
                 server.shutdown()
                 server.server_close()
+
+
+class TestBrowserLaunchResilience(unittest.TestCase):
+    """起動直後にプロセスが終了しても解析を続行できることと、起動バリエーションの検証。"""
+
+    def test_wait_for_debugger_survives_process_exit_when_port_answers(self) -> None:
+        """プロセスが終了してもデバッグポートが応答すれば起動成功として扱うこと。
+
+        ブラウザは更新の適用や処理の引き継ぎで、起動直後のプロセスだけが終了することがある。
+        プロセスの終了だけで即失敗にすると、その後にポートが応答しても解析を始められない。
+        """
+
+        class _ExitedProc:
+            """終了済みのブラウザプロセスの代役。"""
+
+            returncode = 0
+
+            def poll(self) -> int:
+                """終了済みとして 0 を返す。"""
+                return 0
+
+        import m3u8dl.browser as browser_module
+
+        statuses: list[str] = []
+        calls = {'count': 0}
+        original = browser_module._http_get_json
+
+        def fake_get_json(port: int, path: str, timeout: float = 1.0) -> object:
+            """最初の 2 回は接続失敗、3 回目以降は応答する偽のデバッグポート。
+
+            Args:
+                port: デバッグポート。
+                path: リクエストパス。
+                timeout: タイムアウト (秒)。
+
+            Returns:
+                3 回目以降は /json/version 相当の辞書。
+
+            Raises:
+                OSError: 最初の 2 回は接続失敗として送出する。
+            """
+            calls['count'] += 1
+            if calls['count'] < 3:
+                raise OSError('not ready')
+            return {'webSocketDebuggerUrl': 'ws://127.0.0.1:1/devtools/page/1'}
+
+        sniffer = BrowserSniffer(on_request=lambda request: None, on_status=statuses.append)
+        sniffer._proc = _ExitedProc()  # type: ignore[assignment]
+        browser_module._http_get_json = fake_get_json
+        try:
+            # 例外が出なければ、プロセスの終了後もポートの応答を待って起動成功と判定できている
+            sniffer._wait_for_debugger(9222)
+            self.assertEqual(sniffer._port, 9222)
+        finally:
+            browser_module._http_get_json = original
+            sniffer._proc = None
+
+        self.assertTrue(
+            any('待っています' in status for status in statuses),
+            f'プロセス終了後にポートを待つ状態メッセージが出ていない: {statuses}',
+        )
+
+    def test_launch_variants_fall_back_to_no_sandbox(self) -> None:
+        """既定の起動の次に、サンドボックスを無効化した起動が用意されていること。"""
+        from m3u8dl.browser import _launch_variants
+
+        variants = _launch_variants()
+        self.assertGreaterEqual(len(variants), 2)
+        self.assertEqual(variants[0][0], '既定')
+        self.assertEqual(variants[0][1], ())
+        self.assertTrue(
+            any('--no-sandbox' in arguments for _, arguments in variants),
+            f'サンドボックス無効の起動が無い: {variants}',
+        )
+
+    def test_start_reports_every_variant(self) -> None:
+        """起動に失敗したとき、試した起動バリエーションがすべて報告されること。"""
+        import m3u8dl.browser as browser_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 「実在するが実行できないファイル」を候補にして起動失敗を再現する
+            broken = Path(tmp) / 'broken_browser.exe'
+            broken.write_text('not an executable', encoding='utf-8')
+            original = browser_module._browser_candidates
+            browser_module._browser_candidates = lambda: [str(broken)]
+            sniffer = BrowserSniffer(on_request=lambda request: None)
+            try:
+                with self.assertRaises(BrowserError) as context:
+                    sniffer.start('about:blank')
+            finally:
+                browser_module._browser_candidates = original
+                sniffer.stop()
+
+            message = str(context.exception)
+            self.assertIn('broken_browser.exe (既定)', message)
+            self.assertIn('broken_browser.exe (sandbox 無効)', message)
+
+    def test_stop_is_silent_when_idle(self) -> None:
+        """何も動いていないときの stop() は状態メッセージを出さないこと。
+
+        起動失敗の処理では stop() が 2 回呼ばれるため、ログが二重に出ないようにしている。
+        """
+        statuses: list[str] = []
+        sniffer = BrowserSniffer(on_request=lambda request: None, on_status=statuses.append)
+        sniffer.stop()
+        sniffer.stop()
+        self.assertEqual(
+            [status for status in statuses if '停止しました' in status],
+            [],
+            f'停止メッセージが出力された: {statuses}',
+        )
+
+    def test_profile_report_notes_missing_profile(self) -> None:
+        """一時プロファイルが未作成のとき、その旨が報告されること。"""
+        sniffer = BrowserSniffer(on_request=lambda request: None)
+        self.assertIn('未作成', sniffer._profile_report())
+
+    def test_creation_flags_detach_from_parent(self) -> None:
+        """ブラウザを親から切り離して起動する生成フラグを使うこと。
+
+        親のコンソールやジョブオブジェクトに繋がった状態で起動すると、Chromium 系ブラウザが
+        何も出力せずに終了コード 0 で即終了することがあるため、切り離しフラグを必須にしている。
+        """
+        import m3u8dl.browser as browser_module
+
+        if os.name != 'nt':
+            self.skipTest('Windows 専用の検証')
+        flags = browser_module._BROWSER_CREATION_FLAGS
+        self.assertTrue(flags & subprocess.DETACHED_PROCESS, 'コンソールの切り離しが指定されていない')
+        self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP, '新しいプロセスグループが指定されていない')
+        self.assertTrue(flags & subprocess.CREATE_BREAKAWAY_FROM_JOB, 'ジョブオブジェクトからの離脱が指定されていない')
+        # 離脱を拒否する環境向けの予備フラグでは、離脱だけを外す
+        fallback = browser_module._BROWSER_CREATION_FLAGS_FALLBACK
+        self.assertTrue(fallback & subprocess.DETACHED_PROCESS)
+        self.assertFalse(fallback & subprocess.CREATE_BREAKAWAY_FROM_JOB)
+
+    def test_spawn_browser_retries_without_breakaway(self) -> None:
+        """離脱が拒否されたとき、離脱なしの生成フラグで再試行すること。"""
+        from unittest import mock
+
+        if os.name != 'nt':
+            self.skipTest('Windows 専用の検証')
+        sniffer = BrowserSniffer(on_request=lambda request: None)
+        sentinel = object()
+        with mock.patch('subprocess.Popen', side_effect=[OSError(5, 'access denied'), sentinel]) as popen:
+            proc, used_flags = sniffer._spawn_browser(['chrome.exe', 'about:blank'], None)
+        self.assertIs(proc, sentinel)
+        self.assertEqual(popen.call_count, 2, '再試行されていない')
+        first = popen.call_args_list[0].kwargs['creationflags']
+        second = popen.call_args_list[1].kwargs['creationflags']
+        self.assertNotEqual(first, second, '同じ生成フラグで再試行している')
+        self.assertEqual(used_flags, second)
+
+    def test_spawn_browser_reports_failure(self) -> None:
+        """どの生成フラグでも起動できなければ BrowserError になること。"""
+        from unittest import mock
+
+        sniffer = BrowserSniffer(on_request=lambda request: None)
+        with mock.patch('subprocess.Popen', side_effect=OSError(5, 'access denied')):
+            with self.assertRaises(BrowserError) as context:
+                sniffer._spawn_browser(['chrome.exe', 'about:blank'], None)
+        self.assertIn('ブラウザの起動に失敗しました', str(context.exception))
 
 
 if __name__ == '__main__':

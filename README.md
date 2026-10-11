@@ -70,7 +70,9 @@ py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 - `test_integration_local_hls.py` — ffmpeg で生成した実 HLS (平文 / AES-128) を配信して end-to-end で検証
 - `test_gui_smoke.py` — GUI の起動スモークテスト
 - `test_gui_download_e2e.py` — GUI (DownloaderApp) の「ダウンロード開始」経路から mp4 が完成するまでの検証 (キャンセルも含む)
-- `test_browser.py` — 実ブラウザ (Chrome/Edge) を起動して CDP 解析が動くことの検証
+- `test_gui_analysis_e2e.py` — GUI の「ブラウザで解析」経路でプレイリストとバリアントが一覧に反映され、停止できることの検証
+- `test_browser.py` — 実ブラウザ (Chrome/Edge) を起動して CDP 解析が動くことの検証 (起動失敗時の診断・フォールバックも含む)
+- `test_console_encoding.py` — コンソールへ出力するソースが cp932 で表せる文字だけで書かれていることの確認
 
 exe の動作確認:
 
@@ -80,6 +82,9 @@ dist\m3u8dl.exe --selftest "%TEMP%\m3u8dl_selftest.json"
 
 rem 画面を出さずにブラウザ解析だけを実行 (検出した URL を JSON に書き出す)
 dist\m3u8dl.exe --sniff "https://hls-js.netlify.app/demo/" --seconds 20 --out sniff.json
+
+rem 「ブラウザで解析」が始まらない環境の切り分けレポートを書き出す
+dist\m3u8dl.exe --diagnose "%USERPROFILE%\Desktop\m3u8dl_diagnose.txt"
 
 rem 画面を出さずにダウンロード (バッチ実行にも使える)
 dist\m3u8dl.exe --download "https://example.com/playlist.m3u8" "C:\Users\me\Downloads\out.mp4" ^
@@ -120,7 +125,7 @@ m3u8dl/
   crypto_aes.py        AES-128-CBC 復号
   cookies.py           Cookie の解釈・変換・保存
   errors.py            例外定義
-main.py                エントリポイント (--selftest / --sniff / --download / --version)
+main.py                エントリポイント (--selftest / --sniff / --diagnose / --download / --version)
 INTERFACES.md          モジュール間インターフェース契約
 ```
 
@@ -130,10 +135,16 @@ INTERFACES.md          モジュール間インターフェース契約
 
 解析用ブラウザ (Chrome / Edge / Brave) が起動直後に終了しています。ツールは自動で次の候補ブラウザへ切り替えるため、この表示が出るときは**すべての候補ブラウザで失敗**しています。原因の切り分けは以下で行えます。
 
-- エラーメッセージに終了コードと、ブラウザ自身の出力の末尾がそのまま表示されます。
+- `--diagnose` で切り分けレポートを書き出せます。ブラウザごとに「リモートデバッグ付きの起動 (画面あり / ヘッドレス)」「リモートデバッグ無しの起動」を実際に試し、リモートデバッグを禁止するポリシーの有無も確認します。
+
+  ```bat
+  dist\m3u8dl.exe --diagnose "%USERPROFILE%\Desktop\m3u8dl_diagnose.txt"
+  ```
+
+- エラーメッセージに終了コード、ブラウザ自身の出力の末尾、一時プロファイルの状態がそのまま表示されます (ファイル数 0 ならブラウザは初期化前に終了しています)。
 - ブラウザの起動ログは `%TEMP%\m3u8dl_browser_launch.log` に追記されます (起動引数とブラウザの出力)。
-- Chrome / Edge が**自動更新の適用待ち**の状態だと起動直後に終了することがあります。ブラウザを手動で起動して更新を終わらせてから再試行してください。
-- Brave など一部のブラウザはセキュリティポリシーでリモートデバッグが禁止されていることがあります。その場合は別のブラウザ (Chrome など) をインストールしてください。
+- Chrome / Edge が**自動更新の適用待ち**の状態だと起動直後に終了することがあります。ツールは起動プロセスが終了しても数秒間デバッグポートの応答を待ち、それでもだめならサンドボックスを無効化した起動も試します。ブラウザを手動で起動して更新を終わらせてから再試行すると確実です。
+- リモートデバッグがポリシーで禁止されている環境では、どのブラウザでも解析はできません。`--diagnose` のポリシー欄を確認し、ブラウザ側の設定 (またはシステム管理者) でリモートデバッグを許可するか、Cookie を貼り付けてのダウンロード機能を使ってください。
 
 ## 制約事項
 

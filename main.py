@@ -3,6 +3,8 @@
 起動方法:
   m3u8dl.exe                                    GUI を起動する
   m3u8dl.exe --selftest <path.json>             画面を出さずに結合検証だけを行う (exe 検証用)
+  m3u8dl.exe --sniff <url> [--seconds <n>]      画面を出さずにブラウザ解析だけを行う (検証用)
+  m3u8dl.exe --diagnose <path.txt>              ブラウザ解析が始まらない環境の切り分けレポートを書き出す
   m3u8dl.exe --download <url> <out> [options]   画面を出さずにダウンロードする (バッチ / 検証用)
   m3u8dl.exe --version                          バージョンを表示する
 """
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import sys
 from pathlib import Path
 
@@ -268,6 +271,239 @@ def _run_cli_sniff(argv: list[str]) -> int:
     return 0 if report.get('ok') and report['playlists'] else 1
 
 
+def _read_browser_policies() -> list[str]:
+    """リモートデバッグを禁止しうるブラウザのグループポリシーを読み出す (Windows のみ)。
+
+    Chromium 系ブラウザは「リモートデバッグを許可する」ポリシーが無効にされていると、
+    リモートデバッグ付きの起動要求を拒否する。この場合ブラウザは何も出力せずに終了することがあり、
+    3 種類すべてのブラウザが同じ理由で失敗する説明が付く。ここでは疑わしいポリシーの現在値を
+    読み出して診断レポートに載せる (ポリシーが未設定なら「設定なし」と分かる)。
+
+    Returns:
+        ポリシーの状態を表す行のリスト。
+    """
+    if sys.platform != 'win32':
+        return ['(Windows 以外のため未確認)']
+    import winreg
+
+    # ベンダーごとのポリシー格納先 (Chromium 系ブラウザはそれぞれ別の階層にポリシーを持つ)
+    vendor_keys = [
+        r'SOFTWARE\Policies\Google\Chrome',
+        r'SOFTWARE\Policies\Microsoft\Edge',
+        r'SOFTWARE\Policies\BraveSoftware\Brave',
+        r'SOFTWARE\Manageable\Google\Chrome',
+    ]
+    # (値の名前, 値の意味の説明, 危険な値)
+    value_targets = [
+        ('RemoteDebuggingAllowed', 'リモートデバッグの許可', 0),
+        ('DevToolsAvailability', 'DevTools の許可 (2=禁止)', 2),
+    ]
+    lines: list[str] = []
+    for hive, hive_name in ((winreg.HKEY_LOCAL_MACHINE, 'HKLM'), (winreg.HKEY_CURRENT_USER, 'HKCU')):
+        for key_path in vendor_keys:
+            for value_name, description, blocking_value in value_targets:
+                try:
+                    with winreg.OpenKey(hive, key_path) as key:
+                        value, _ = winreg.QueryValueEx(key, value_name)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    lines.append(f'  {hive_name}\\{key_path} {value_name}: 読み出し失敗 ({exc})')
+                    continue
+                # 禁止値が設定されていれば、この環境ではブラウザ解析を開始できない
+                mark = ' ※これが失敗の原因' if value == blocking_value else ''
+                lines.append(f'  {hive_name}\\{key_path} {value_name} = {value} ({description}){mark}')
+    return lines if lines else ['  リモートデバッグを禁止するポリシーは設定されていない']
+
+
+def _decode_browser_output(raw: bytes) -> str:
+    """ブラウザの標準出力を文字化けさせずに文字列へ変換する。
+
+    Chromium 系ブラウザは日本語環境でメッセージを UTF-8 ではなくシステムのコードページ (cp932) で
+    出力することがあるため、UTF-8 で読めなければ cp932 を試す。
+
+    Args:
+        raw: ブラウザが出力したバイト列。
+
+    Returns:
+        変換後の文字列 (失敗したバイトは置換文字にする)。
+    """
+    for encoding in ('utf-8', 'cp932'):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('utf-8', errors='replace')
+
+
+def _run_cli_diagnose(argv: list[str]) -> int:
+    """ブラウザ解析が開始できない環境を切り分けるためのレポートを 1 ファイルに書き出す。
+
+    標準出力が使えない windowed exe でも確認できるよう、結果は指定ファイルへ書き出す。
+    次の順に調べる。
+
+    1. 実行環境 (バージョン・Python・一時ディレクトリ・管理者権限・セッション)
+    2. リモートデバッグを禁止しうるブラウザのポリシー
+    3. 検出したブラウザとそのバージョン
+    4. ブラウザごとに「リモートデバッグ付きの起動 (ヘッドレス / 画面あり)」と
+       「リモートデバッグ無しの起動」を試し、どちらで失敗しているかを切り分ける
+    5. ブラウザ起動ログの末尾
+
+    Args:
+        argv: `--diagnose` 以降を含むコマンドライン引数。
+
+    Returns:
+        終了コード (0=レポートを書き出した, 2=引数エラー)。
+    """
+    import ctypes
+    import platform
+    import shutil
+    import subprocess as subprocess_module
+    import tempfile
+    import time as time_module
+
+    from m3u8dl import __version__
+    from m3u8dl.browser import BrowserSniffer, _browser_candidates
+
+    index = argv.index('--diagnose')
+    out_text = argv[index + 1] if len(argv) > index + 1 and not argv[index + 1].startswith('--') else 'm3u8dl_diagnose.txt'
+    out_path = Path(out_text).expanduser()
+
+    lines: list[str] = []
+
+    def add(text: str = '') -> None:
+        """レポートに 1 行追加する。
+
+        レポートファイルは UTF-8 で書くため、コンソールの文字コード (Windows の既定は cp932) で
+        表せない文字があってもレポート自体は欠けない。コンソール出力だけは置換して継続する。
+
+        Args:
+            text: 追記する行。
+        """
+        lines.append(text)
+        try:
+            print(text, flush=True)
+        except UnicodeEncodeError:
+            # コンソールで表せない文字 (em dash など) は置換して出す
+            encoding = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+            print(text.encode(encoding, errors='replace').decode(encoding, errors='replace'), flush=True)
+
+    creationflags = getattr(subprocess_module, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+
+    # 1. 実行環境
+    add(f'm3u8dl {__version__} 診断レポート')
+    add(f'日時: {time_module.strftime("%Y-%m-%d %H:%M:%S")}')
+    add(f'実行ファイル: {sys.executable}')
+    add(f'frozen (exe): {getattr(sys, "frozen", False)}')
+    add(f'Python: {platform.python_version()} / {platform.platform()}')
+    add(f'一時ディレクトリ: {tempfile.gettempdir()}')
+    add(f'ユーザー: {os.environ.get("USERNAME", "")} / セッション: {os.environ.get("SESSIONNAME", "")}')
+    try:
+        elevated = 'はい' if ctypes.windll.shell32.IsUserAnAdmin() else 'いいえ'  # type: ignore[attr-defined]
+    except Exception:
+        elevated = '不明'
+    add(f'管理者権限: {elevated}')
+    add()
+
+    # 2. リモートデバッグを禁止しうるポリシー (設定されていればブラウザ解析は必ず失敗する)
+    add('リモートデバッグ関連のポリシー:')
+    for policy_line in _read_browser_policies():
+        add(policy_line)
+    add()
+
+    # 3. ブラウザの検出とバージョン
+    add('ブラウザ候補:')
+    found: list[str] = []
+    for candidate in _browser_candidates():
+        if not os.path.isfile(candidate):
+            add(f'  [なし] {candidate}')
+            continue
+        found.append(candidate)
+        try:
+            completed = subprocess_module.run(
+                [candidate, '--version'],
+                capture_output=True,
+                timeout=30,
+                creationflags=creationflags,
+            )
+            # ブラウザは日本語のメッセージを cp932 で出力することがあるため、自前でデコードする
+            output = _decode_browser_output(completed.stdout or completed.stderr).strip().splitlines()
+            add(f'  [あり] {candidate} - {output[0] if output else "バージョン不明"}')
+        except (OSError, subprocess_module.SubprocessError) as exc:
+            add(f'  [あり] {candidate} - バージョン取得失敗: {exc}')
+    add()
+
+    if not found:
+        add('対応ブラウザが見つからないため、これ以上診断できません。')
+        out_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        return 0
+
+    # 4. ブラウザごとの起動テスト
+    for browser in found:
+        name = os.path.basename(browser)
+        add(f'--- {name} ---')
+
+        # (a) リモートデバッグ付き (画面あり / ヘッドレス)
+        for headless in (False, True):
+            mode = 'ヘッドレス' if headless else '画面あり'
+            sniffer = BrowserSniffer(on_request=lambda request: None, browser_path=browser, headless=headless)
+            try:
+                sniffer.start('about:blank')
+                add(f'  リモートデバッグ {mode}: 成功 (デバッグポート {sniffer._port})')
+            except Exception as exc:
+                first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else repr(exc)
+                add(f'  リモートデバッグ {mode}: 失敗 - {first_line}')
+            finally:
+                try:
+                    sniffer.stop()
+                except Exception:
+                    # 診断を続けるため、停止時の例外は無視する
+                    pass
+
+        # (b) リモートデバッグ無し (ブラウザ自体がこの環境で起動できるかの切り分け)
+        profile_dir = Path(tempfile.mkdtemp(prefix='m3u8dl_diag_'))
+        try:
+            proc = subprocess_module.Popen(
+                [browser, f'--user-data-dir={profile_dir}', '--no-first-run', 'about:blank'],
+                stdout=subprocess_module.DEVNULL,
+                stderr=subprocess_module.DEVNULL,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            add(f'  デバッグ無し起動: 起動できません - {exc}')
+        else:
+            time_module.sleep(3.0)
+            return_code = proc.poll()
+            if return_code is None:
+                add('  デバッグ無し起動: 3 秒後も生存 (ブラウザ自体は起動できる)')
+            else:
+                add(f'  デバッグ無し起動: 3 秒以内に終了 (exit code={return_code}) → この環境ではブラウザ自体が起動できません')
+            subprocess_module.run(
+                ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+            )
+        finally:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        add()
+
+    # 5. 起動ログの末尾
+    log_path = Path(tempfile.gettempdir()) / 'm3u8dl_browser_launch.log'
+    add(f'--- ブラウザ起動ログ ({log_path}) の末尾 ---')
+    try:
+        tail = log_path.read_text(encoding='utf-8', errors='replace').strip().splitlines()[-30:]
+        lines.extend(tail if tail else ['(空)'])
+    except OSError as exc:
+        add(f'(ログを読めません: {exc})')
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    print(f'[m3u8dl] 診断レポート: {out_path}', flush=True)
+    return 0
+
+
 def main() -> int:
     """アプリケーションを起動する。
 
@@ -301,6 +537,10 @@ def main() -> int:
     # 画面なしのブラウザ解析 (exe のブラウザ解析経路の実動作検証用)
     if '--sniff' in sys.argv:
         return _run_cli_sniff(sys.argv)
+
+    # ブラウザ解析が始められない環境の切り分けレポート (結果はファイルへ書き出す)
+    if '--diagnose' in sys.argv:
+        return _run_cli_diagnose(sys.argv)
 
     # 自己テストモード: GUI を出さずに結合検証だけ行い JSON を書き出す
     if '--selftest' in sys.argv:

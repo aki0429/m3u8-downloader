@@ -22,7 +22,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import IO, Callable
 from urllib.parse import urlparse
 
 from m3u8dl.errors import BrowserError
@@ -38,6 +38,42 @@ _SEGMENT_MARKERS = ('.ts', '.m4s', '.mp4', '.aac')
 
 # デバッグポートと page ターゲットを待つ最大時間 (秒)
 _DEBUGGER_WAIT_SECONDS = 20.0
+
+# 起動したプロセスが終了しても、デバッグポートの応答を待ち続ける時間 (秒)。
+# 更新適用のための再起動や、別プロセスへ処理を引き継いで元のプロセスだけが終了する場合があるため、
+# プロセスの終了だけで「起動失敗」と決めつけない。
+_POST_EXIT_GRACE_SECONDS = 5.0
+
+# ブラウザを親プロセスから完全に切り離して起動するための生成フラグ (Windows のみ)。
+# Chromium 系ブラウザは、親のコンソールやジョブオブジェクトに繋がった状態で起動されると、
+# 何も出力せずに終了コード 0 で即終了することがある (親がコンソールを持たない GUI アプリのときに起きやすい)。
+# DETACHED_PROCESS でコンソールの引き継ぎを断ち、CREATE_BREAKAWAY_FROM_JOB で
+# 「親の終了で巻き込まれる」ジョブオブジェクトから離脱させる。
+_BROWSER_CREATION_FLAGS = (
+    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_BREAKAWAY_FROM_JOB
+) if os.name == 'nt' else 0
+
+# CREATE_BREAKAWAY_FROM_JOB はジョブオブジェクト側が離脱を許可していないと失敗するため、
+# それを外した生成フラグも用意する (この場合はコンソールの切り離しだけを行う)。
+_BROWSER_CREATION_FLAGS_FALLBACK = (
+    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+) if os.name == 'nt' else 0
+
+
+def _launch_variants() -> list[tuple[str, tuple[str, ...]]]:
+    """ブラウザの起動引数のバリエーションを試行順に返す。
+
+    1 つ目の「既定」で失敗した場合に備え、サンドボックスを無効化した起動も試せるようにしている。
+    セキュリティ製品や制限された実行環境では、既定の起動が何も出力せずに即終了することがある。
+
+    Returns:
+        (表示名, 追加引数) のリスト (試行順)。
+    """
+    return [
+        ('既定', ()),
+        # 専用の一時プロファイルしか使わないため、フォールバックとしての影響は限定的
+        ('sandbox 無効', ('--no-sandbox', '--disable-gpu')),
+    ]
 
 
 @dataclass
@@ -240,28 +276,80 @@ class BrowserSniffer:
         self._port = port
 
         failures: list[str] = []
-        for index, candidate in enumerate(candidates):
+        # 「ブラウザ × 起動引数のバリエーション」を順に試す
+        attempts = [
+            (candidate, variant, extra_arguments)
+            for candidate in candidates
+            for variant, extra_arguments in _launch_variants()
+        ]
+        for index, (candidate, variant, extra_arguments) in enumerate(attempts):
             try:
-                self._launch_and_connect(candidate, url, port)
+                self._launch_and_connect(candidate, url, port, extra_arguments)
                 return
             except (BrowserError, OSError) as exc:
                 # 起動しかけたプロセスとソケットを片付けてから次の候補へ進む
-                failures.append(f'{os.path.basename(candidate)}: {exc}')
+                failures.append(f'{os.path.basename(candidate)} ({variant}): {exc}')
                 self.stop()
-                if index + 1 < len(candidates):
+                if index + 1 < len(attempts):
+                    next_candidate, next_variant, _ = attempts[index + 1]
                     self._emit_status(
                         f'{os.path.basename(candidate)} では解析を開始できませんでした。'
-                        f'{os.path.basename(candidates[index + 1])} で再試行します...'
+                        f'{os.path.basename(next_candidate)} ({next_variant}) で再試行します...'
                     )
         raise BrowserError('ブラウザ解析を開始できませんでした:\n' + '\n'.join(failures))
 
-    def _launch_and_connect(self, browser_path: str, url: str, port: int) -> None:
+    def _spawn_browser(
+        self,
+        arguments: list[str],
+        log_stream: IO[str] | None,
+    ) -> tuple[subprocess.Popen[bytes], int]:
+        """ブラウザのプロセスを起動する (生成フラグを順に試す)。
+
+        ジョブオブジェクトからの離脱を許可していない環境があるため、離脱ありの生成フラグで失敗したら
+        離脱なしの生成フラグで再試行する (コンソールの切り離しはどちらでも行う)。
+
+        Args:
+            arguments: 起動するコマンドライン引数。
+            log_stream: ブラウザの出力を書き出すファイル (None なら出力を破棄する)。
+
+        Returns:
+            (起動したプロセス, 実際に使った生成フラグ)。
+
+        Raises:
+            BrowserError: どの生成フラグでもプロセスを起動できなかったとき。
+        """
+        # 同じフラグを 2 回試さないようにしつつ、試行順を保つ
+        flag_candidates = list(dict.fromkeys((_BROWSER_CREATION_FLAGS, _BROWSER_CREATION_FLAGS_FALLBACK)))
+        last_error: OSError | None = None
+        for spawn_flags in flag_candidates:
+            try:
+                proc = subprocess.Popen(
+                    arguments,
+                    stdout=log_stream if log_stream is not None else subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT,
+                    creationflags=spawn_flags,
+                )
+            except OSError as exc:
+                # 生成フラグが原因の失敗 (離脱の拒否など) なら次の候補を試す
+                last_error = exc
+                continue
+            return proc, spawn_flags
+        raise BrowserError(f'ブラウザの起動に失敗しました: {last_error}')
+
+    def _launch_and_connect(
+        self,
+        browser_path: str,
+        url: str,
+        port: int,
+        extra_arguments: tuple[str, ...] = (),
+    ) -> None:
         """指定ブラウザを起動して CDP に接続し、解析を開始する。
 
         Args:
             browser_path: 起動するブラウザの実行ファイルパス。
             url: 最初に開く URL。
             port: リモートデバッグポート。
+            extra_arguments: 既定の引数に追加する起動引数 (起動バリエーション用)。
 
         Raises:
             BrowserError: 起動・接続・解析開始のいずれかに失敗したとき。
@@ -294,6 +382,8 @@ class BrowserSniffer:
             # 解析中に音を鳴らさない
             '--mute-audio',
         ]
+        # 起動バリエーションの追加引数 (サンドボックス無効化など) を足す
+        arguments.extend(extra_arguments)
         if self._headless:
             arguments.append('--headless=new')
         arguments.append('about:blank')
@@ -310,21 +400,21 @@ class BrowserSniffer:
         except OSError:
             log_stream = None
 
-        # Windows ではコンソールウィンドウを出さないようにする
-        creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+        # Windows では親から完全に切り離して起動する (切り離さないとブラウザが即終了することがある)
         self._emit_status('ブラウザを起動しています...')
         try:
-            self._proc = subprocess.Popen(
-                arguments,
-                stdout=log_stream if log_stream is not None else subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                creationflags=creationflags,
-            )
-        except OSError as exc:
+            self._proc, spawn_flags = self._spawn_browser(arguments, log_stream)
+        except BrowserError:
+            # 起動できなかったので、この試行で作った一時プロファイルを片付ける
+            if log_stream is not None:
+                log_stream.close()
             self._cleanup_profile()
-            raise BrowserError(f'ブラウザの起動に失敗しました: {exc}') from exc
-        # 子プロセスがハンドルを引き継いだので親側は閉じる (ログは追記され続ける)
+            raise
         if log_stream is not None:
+            # 実際に使った生成フラグを記録してから閉じる (切り分け用)
+            log_stream.write(f'spawn flags: {spawn_flags:#x}\n')
+            log_stream.flush()
+            # 子プロセスがハンドルを引き継いだので親側は閉じる (ログは追記され続ける)
             log_stream.close()
 
         try:
@@ -360,6 +450,9 @@ class BrowserSniffer:
 
     def stop(self) -> None:
         """解析を停止し、ブラウザを終了してソケットを切断する。冪等。"""
+        # 何も動いていないときに呼ばれた場合は状態メッセージを出さない
+        # (起動失敗の処理中に 2 回呼ばれるため、ログが二重に流れるのを防ぐ)
+        was_active = self._running or self._proc is not None or self._ws is not None
         self._running = False
 
         # 受信ループが読んでいるソケットを閉じる (ブロックしない)
@@ -386,7 +479,8 @@ class BrowserSniffer:
         self._cleanup_profile()
         with self._requests_lock:
             self._requests.clear()
-        self._emit_status('ブラウザ解析を停止しました')
+        if was_active:
+            self._emit_status('ブラウザ解析を停止しました')
 
     def is_running(self) -> bool:
         """解析中 (ブラウザと CDP 接続が生きている) かどうかを返す。
@@ -468,9 +562,10 @@ class BrowserSniffer:
     def _wait_for_debugger(self, port: int) -> None:
         """デバッグポートが応答するまで (最大 20 秒) ポーリングする。
 
-        ブラウザが起動直後に終了した場合は、終了コードとブラウザの出力ログの末尾をメッセージに含める
-        (Chrome の自動更新中・ポリシー制限・プロファイル破損などの切り分けに使う)。
-        ブラウザが指定ポートではなく独自のポートで待ち受けている場合は DevToolsActivePort を読む。
+        起動したプロセスが先に終了した場合でも、すぐには失敗としない。ブラウザは更新の適用や
+        処理の引き継ぎのために、起動直後のプロセスだけが終了することがあるため、
+        `_POST_EXIT_GRACE_SECONDS` の間はデバッグポートの応答を待ち続ける。
+        それでも応答が無ければ、終了コード・ブラウザの出力・一時プロファイルの状態を添えて報告する。
 
         Args:
             port: デバッグポート。
@@ -479,13 +574,20 @@ class BrowserSniffer:
             BrowserError: ブラウザが途中で終了した、または 20 秒応答が無いとき。
         """
         deadline = time.monotonic() + _DEBUGGER_WAIT_SECONDS
+        exited_at: float | None = None
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
-                raise BrowserError(
-                    f'ブラウザが起動直後に終了しました (exit code={self._proc.returncode})。'
-                    'Chrome/Edge の更新中やセキュリティポリシーによる制限の可能性があります。'
-                    f'{self._launch_log_tail()}'
-                )
+                if exited_at is None:
+                    # プロセスの終了自体は失敗と決めつけず、ポートの応答を待ち続ける
+                    exited_at = time.monotonic()
+                    self._emit_status('ブラウザの起動プロセスが終了しました。デバッグポートの応答を待っています...')
+                elif time.monotonic() - exited_at > _POST_EXIT_GRACE_SECONDS:
+                    raise BrowserError(
+                        f'ブラウザが起動直後に終了しました (exit code={self._proc.returncode})。'
+                        'Chrome/Edge の更新中やセキュリティ製品・ポリシーによる制限の可能性があります。'
+                        f'\n{self._profile_report()}'
+                        f'{self._launch_log_tail()}'
+                    )
             # ブラウザが自前で決めたポートで待ち受けている場合に備えて DevToolsActivePort の値も見る
             active_port = self._read_devtools_active_port()
             candidate_ports = [active_port, port] if active_port is not None and active_port != port else [port]
@@ -499,7 +601,10 @@ class BrowserSniffer:
                     self._port = candidate_port
                     return
             time.sleep(0.2)
-        raise BrowserError('デバッグポートの応答を 20 秒待ちましたが応答がありません')
+        raise BrowserError(
+            f'デバッグポートの応答を {_DEBUGGER_WAIT_SECONDS:.0f} 秒待ちましたが応答がありません。'
+            f'\n{self._profile_report()}'
+        )
 
     def _read_devtools_active_port(self) -> int | None:
         """プロファイル内の DevToolsActivePort からブラウザが実際に使っているポートを読む。
@@ -520,6 +625,25 @@ class BrowserSniffer:
             return None
         first_line = lines[0].strip()
         return int(first_line) if first_line.isdigit() else None
+
+    def _profile_report(self) -> str:
+        """一時プロファイルの状態をエラーメッセージ用に 1 行で要約する。
+
+        ブラウザが本当に起動処理を進めたのか (プロファイルを作ったのか) を切り分けるために使う。
+        ファイルが 1 つも無ければ、ブラウザは初期化前に終了している。
+
+        Returns:
+            プロファイルのパス・作成されたファイル数・DevToolsActivePort の有無。
+        """
+        if self._profile is None:
+            return '一時プロファイル: 未作成'
+        try:
+            names = sorted(entry.name for entry in self._profile.iterdir())
+        except OSError as exc:
+            return f'一時プロファイル: {self._profile} (内容を読めません: {exc})'
+        active_port = 'DevToolsActivePort あり' if 'DevToolsActivePort' in names else 'DevToolsActivePort なし'
+        head = ', '.join(names[:6])
+        return f'一時プロファイル: {self._profile} / ファイル {len(names)} 件 [{head}] / {active_port}'
 
     def _launch_log_tail(self, length: int = 800) -> str:
         """ブラウザ起動ログの末尾をエラーメッセージに添える形で取り出す。
@@ -555,10 +679,8 @@ class BrowserSniffer:
         """
         deadline = time.monotonic() + _DEBUGGER_WAIT_SECONDS
         while time.monotonic() < deadline:
-            if self._proc is not None and self._proc.poll() is not None:
-                raise BrowserError(
-                    f'ブラウザが起動直後に終了しました (exit code={self._proc.returncode}){self._launch_log_tail()}'
-                )
+            # ここではデバッグポートは応答済み。起動プロセスの終了だけで打ち切らない
+            # (更新適用や処理の引き継ぎでプロセスだけが入れ替わることがあるため)。
             # ブラウザが持つ page ターゲットは、実際に待ち受けているポートから探す
             active_port = self._read_devtools_active_port()
             for candidate_port in ((active_port, port) if active_port is not None and active_port != port else (port,)):

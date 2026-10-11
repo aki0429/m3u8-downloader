@@ -143,13 +143,11 @@ class TestParseMasterPlaylist(unittest.TestCase):
         ])
 
     def test_comment_line_between_tag_and_uri(self) -> None:
-        """#EXT-X-STREAM-INF と URI の間にコメント行がある場合の挙動を確認する。
+        """#EXT-X-STREAM-INF と URI の間にコメント行があっても全バリアントが解決されること。
 
         HLS 仕様はこの位置のコメント行を明確に禁止していないが、一般的な実装
-        (hls.js 等) はコメント行を読み飛ばして次の URI 行を採用する。現行の hls.py は
-        '#' で始まる行に当たると打ち切るため、そのバリアントが落ちる (担当B への報告事項)。
-        本テストは「どちらの実装でも落ちない・解決できた URL は正しい」ことのみを検証し、
-        件数は現行 (1) と理想 (2) の両方を許容する。
+        (hls.js 等) はコメント行を読み飛ばして次の URI 行を採用する。hls.py も
+        '#EXT' タグ以外のコメント行は読み飛ばすように修正済み (2026-10-12)。
         """
         text = (
             '#EXTM3U\n'
@@ -160,10 +158,11 @@ class TestParseMasterPlaylist(unittest.TestCase):
             'high.m3u8\n'
         )
         variants = parse_master_playlist(text, MASTER_BASE)
-        # 現行実装はコメント行で打ち切るため 1 件、理想実装なら 2 件
-        self.assertIn(len(variants), (1, 2))
-        for variant in variants:
-            self.assertTrue(variant.url.startswith('https://example.com/hls/main/'))
+        # コメント行を読み飛ばして両方のバリアントを取り出すこと
+        self.assertEqual([v.url for v in variants], [
+            'https://example.com/hls/main/low.m3u8',
+            'https://example.com/hls/main/high.m3u8',
+        ])
 
     def test_relative_dotdot_resolution(self) -> None:
         """'../' を含む相対 URL が urljoin で正しく正規化されること。"""

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-build/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# 動作確認で生成されるファイル
+selftest.json
+downloads/
+scratch/
+*.ts
+*.mp4
+*_segments/
+
+# エディタ / OS
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

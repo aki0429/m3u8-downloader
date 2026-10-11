@@ -97,7 +97,8 @@ class TestGuiStartupSmoke(unittest.TestCase):
             command = [sys.executable, '-m', 'm3u8dl.gui']
 
         # 起動ログ (クラッシュ時の原因確認用) を一時ファイルへ逃がす
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # 子プロセスがログのハンドルを掴んだまま削除に失敗することがあるため、後始末の失敗は無視する
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             log_path = Path(temp_dir) / 'gui_smoke.log'
             with open(log_path, 'w', encoding='utf-8') as log_file:
                 process = subprocess.Popen(
@@ -123,6 +124,8 @@ class TestGuiStartupSmoke(unittest.TestCase):
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait(timeout=5)
+                    # Windows がハンドルを解放するまでわずかに待つ (直後に一時ディレクトリを削除するため)
+                    time.sleep(0.5)
 
             # クラッシュしていた場合に備えてログを失敗メッセージに残す
             log_text = log_path.read_text(encoding='utf-8', errors='replace').strip()

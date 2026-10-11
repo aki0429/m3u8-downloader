@@ -207,24 +207,67 @@ class BrowserSniffer:
         self._requests_lock = threading.Lock()
         # 自前で作った一時プロファイルディレクトリ (stop() で削除する)
         self._temp_profile: str | None = None
+        # 今回の試行で使っているプロファイルディレクトリ (DevToolsActivePort の参照に使う)
+        self._profile: Path | None = None
+        # ブラウザの出力を逃がすログファイル (起動失敗時の原因表示に使う)
+        self._launch_log: Path | None = None
 
     def start(self, url: str) -> None:
         """ブラウザを起動し、CDP に接続して `url` を開き、解析を開始する。
+
+        起動に失敗したときは次の候補ブラウザ (Chrome → Edge → Brave) で自動的に再試行する。
+        Chrome が更新中だったり、特定ブラウザだけがブロックされている環境でも解析を始められるようにするため。
 
         Args:
             url: 最初に開く URL。
 
         Raises:
-            BrowserError: ブラウザが見つからない、起動に失敗した、CDP に接続できないとき。
+            BrowserError: すべての候補ブラウザで失敗したとき。
         """
         if self._running:
             raise BrowserError('既に解析を開始しています')
-        if not self._resolved_browser_path:
+
+        # 試すブラウザを決める。明示指定があればそれだけ、無ければ Chrome → Edge → Brave の順に試す。
+        if self._browser_path:
+            candidates = [self._browser_path]
+        else:
+            candidates = [candidate for candidate in _browser_candidates() if os.path.isfile(candidate)]
+        if not candidates:
             raise BrowserError('対応ブラウザ (Chrome / Edge / Brave) が見つかりません')
 
         # ポートを決める (0 指定なら空きポートを確保する)
         port = self._port if self._port and self._port > 0 else _find_free_port()
         self._port = port
+
+        failures: list[str] = []
+        for index, candidate in enumerate(candidates):
+            try:
+                self._launch_and_connect(candidate, url, port)
+                return
+            except (BrowserError, OSError) as exc:
+                # 起動しかけたプロセスとソケットを片付けてから次の候補へ進む
+                failures.append(f'{os.path.basename(candidate)}: {exc}')
+                self.stop()
+                if index + 1 < len(candidates):
+                    self._emit_status(
+                        f'{os.path.basename(candidate)} では解析を開始できませんでした。'
+                        f'{os.path.basename(candidates[index + 1])} で再試行します...'
+                    )
+        raise BrowserError('ブラウザ解析を開始できませんでした:\n' + '\n'.join(failures))
+
+    def _launch_and_connect(self, browser_path: str, url: str, port: int) -> None:
+        """指定ブラウザを起動して CDP に接続し、解析を開始する。
+
+        Args:
+            browser_path: 起動するブラウザの実行ファイルパス。
+            url: 最初に開く URL。
+            port: リモートデバッグポート。
+
+        Raises:
+            BrowserError: 起動・接続・解析開始のいずれかに失敗したとき。
+            OSError: ブラウザの実行ファイルを起動できなかったとき。
+        """
+        self._resolved_browser_path = browser_path
 
         # ユーザーデータディレクトリを用意する。省略時は専用の一時ディレクトリを作る。
         if self._user_data_dir is not None:
@@ -233,6 +276,7 @@ class BrowserSniffer:
         else:
             profile = Path(tempfile.mkdtemp(prefix='m3u8dl_browser_'))
             self._temp_profile = str(profile)
+        self._profile = profile
 
         arguments = [
             self._resolved_browser_path,
@@ -245,10 +289,26 @@ class BrowserSniffer:
             '--remote-allow-origins=*',
             '--noerrdialogs',
             '--disable-background-networking',
+            # クリック操作を要求するプレーヤーでも再生が始まるようにする (解析の検出率を上げるため)
+            '--autoplay-policy=no-user-gesture-required',
+            # 解析中に音を鳴らさない
+            '--mute-audio',
         ]
         if self._headless:
             arguments.append('--headless=new')
         arguments.append('about:blank')
+
+        # ブラウザの出力をログファイルへ逃がす (起動直後に終了したときの原因究明に使う)
+        log_path = Path(tempfile.gettempdir()) / 'm3u8dl_browser_launch.log'
+        self._launch_log = log_path
+        log_stream = None
+        try:
+            log_stream = log_path.open('a', encoding='utf-8', errors='replace')
+            log_stream.write(f'\n=== {time.strftime("%Y-%m-%d %H:%M:%S")} {browser_path}\n')
+            log_stream.write('args: ' + ' '.join(arguments[1:]) + '\n')
+            log_stream.flush()
+        except OSError:
+            log_stream = None
 
         # Windows ではコンソールウィンドウを出さないようにする
         creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
@@ -256,18 +316,22 @@ class BrowserSniffer:
         try:
             self._proc = subprocess.Popen(
                 arguments,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_stream if log_stream is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
                 creationflags=creationflags,
             )
         except OSError as exc:
             self._cleanup_profile()
             raise BrowserError(f'ブラウザの起動に失敗しました: {exc}') from exc
+        # 子プロセスがハンドルを引き継いだので親側は閉じる (ログは追記され続ける)
+        if log_stream is not None:
+            log_stream.close()
 
         try:
             self._wait_for_debugger(port)
             self._emit_status('CDP に接続しています...')
-            ws_url = self._find_page_target(port)
+            # ブラウザが実際に使ったポートで接続する (通常は port と同じ)
+            ws_url = self._find_page_target(self._port)
             parsed = urlparse(ws_url)
             connection = WebSocketConnection(
                 parsed.hostname or '127.0.0.1',
@@ -404,6 +468,10 @@ class BrowserSniffer:
     def _wait_for_debugger(self, port: int) -> None:
         """デバッグポートが応答するまで (最大 20 秒) ポーリングする。
 
+        ブラウザが起動直後に終了した場合は、終了コードとブラウザの出力ログの末尾をメッセージに含める
+        (Chrome の自動更新中・ポリシー制限・プロファイル破損などの切り分けに使う)。
+        ブラウザが指定ポートではなく独自のポートで待ち受けている場合は DevToolsActivePort を読む。
+
         Args:
             port: デバッグポート。
 
@@ -413,15 +481,65 @@ class BrowserSniffer:
         deadline = time.monotonic() + _DEBUGGER_WAIT_SECONDS
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
-                raise BrowserError('ブラウザが起動直後に終了しました')
-            try:
-                version = _http_get_json(port, '/json/version', timeout=1.0)
+                raise BrowserError(
+                    f'ブラウザが起動直後に終了しました (exit code={self._proc.returncode})。'
+                    'Chrome/Edge の更新中やセキュリティポリシーによる制限の可能性があります。'
+                    f'{self._launch_log_tail()}'
+                )
+            # ブラウザが自前で決めたポートで待ち受けている場合に備えて DevToolsActivePort の値も見る
+            active_port = self._read_devtools_active_port()
+            candidate_ports = [active_port, port] if active_port is not None and active_port != port else [port]
+            for candidate_port in candidate_ports:
+                try:
+                    version = _http_get_json(candidate_port, '/json/version', timeout=1.0)
+                except (OSError, ValueError):
+                    continue
                 if isinstance(version, dict) and version.get('webSocketDebuggerUrl'):
+                    # 以降の接続もブラウザが実際に使ったポートに合わせる
+                    self._port = candidate_port
                     return
-            except (OSError, ValueError):
-                pass
             time.sleep(0.2)
         raise BrowserError('デバッグポートの応答を 20 秒待ちましたが応答がありません')
+
+    def _read_devtools_active_port(self) -> int | None:
+        """プロファイル内の DevToolsActivePort からブラウザが実際に使っているポートを読む。
+
+        ブラウザは起動時にこのファイルへ実際のポートを書き出すため、指定ポートを無視された
+        場合でも接続先を特定できる。
+
+        Returns:
+            ポート番号。ファイルが無い・読めない・内容が不正なときは None。
+        """
+        if self._profile is None:
+            return None
+        try:
+            lines = self._profile.joinpath('DevToolsActivePort').read_text(encoding='ascii', errors='replace').splitlines()
+        except OSError:
+            return None
+        if not lines:
+            return None
+        first_line = lines[0].strip()
+        return int(first_line) if first_line.isdigit() else None
+
+    def _launch_log_tail(self, length: int = 800) -> str:
+        """ブラウザ起動ログの末尾をエラーメッセージに添える形で取り出す。
+
+        Args:
+            length: 添える最大文字数。
+
+        Returns:
+            ログファイルのパスと末尾。ログが無ければ空文字。
+        """
+        if self._launch_log is None:
+            return ''
+        try:
+            text = self._launch_log.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return ''
+        tail = text.strip()[-length:]
+        if not tail:
+            return ''
+        return f'\n--- ブラウザの出力 ({self._launch_log}) ---\n{tail}'
 
     def _find_page_target(self, port: int) -> str:
         """page ターゲットの WebSocket URL が取得できるまで (最大 20 秒) ポーリングする。
@@ -438,17 +556,22 @@ class BrowserSniffer:
         deadline = time.monotonic() + _DEBUGGER_WAIT_SECONDS
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
-                raise BrowserError('ブラウザが起動直後に終了しました')
-            try:
-                targets = _http_get_json(port, '/json', timeout=1.0)
-            except (OSError, ValueError):
-                targets = None
-            if isinstance(targets, list):
-                for target in targets:
-                    if not isinstance(target, dict):
-                        continue
-                    if target.get('type') == 'page' and target.get('webSocketDebuggerUrl'):
-                        return str(target['webSocketDebuggerUrl'])
+                raise BrowserError(
+                    f'ブラウザが起動直後に終了しました (exit code={self._proc.returncode}){self._launch_log_tail()}'
+                )
+            # ブラウザが持つ page ターゲットは、実際に待ち受けているポートから探す
+            active_port = self._read_devtools_active_port()
+            for candidate_port in ((active_port, port) if active_port is not None and active_port != port else (port,)):
+                try:
+                    targets = _http_get_json(candidate_port, '/json', timeout=1.0)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(targets, list):
+                    for target in targets:
+                        if not isinstance(target, dict):
+                            continue
+                        if target.get('type') == 'page' and target.get('webSocketDebuggerUrl'):
+                            return str(target['webSocketDebuggerUrl'])
             time.sleep(0.2)
         raise BrowserError('CDP の page ターゲットが見つかりません')
 

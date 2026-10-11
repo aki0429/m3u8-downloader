@@ -8,6 +8,7 @@ venv/
 # PyInstaller
 build/
 dist/
+out_v*/
 *.manifest
 
 # 動作確認で生成されるファイル

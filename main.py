@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import sys
 from pathlib import Path
@@ -169,6 +170,104 @@ def _run_cli_download(argv: list[str]) -> int:
     return 0
 
 
+def _run_cli_sniff(argv: list[str]) -> int:
+    """画面を出さずにブラウザ解析だけを実行し、検出した URL を JSON に書き出す。
+
+    GUI を開かずに exe のブラウザ解析経路を実測検証するために用意している。
+    コンソールが無い windowed exe では標準出力が使えないため、結果は必ずファイルへ出す。
+
+    Args:
+        argv: `--sniff` 以降を含むコマンドライン引数。
+
+    Returns:
+        終了コード (0=m3u8 を検出, 1=失敗または未検出, 2=引数エラー)。
+    """
+    import time as time_module
+
+    from m3u8dl.browser import BrowserSniffer
+    from m3u8dl.errors import M3U8DLError
+
+    index = argv.index('--sniff') + 1
+    if index >= len(argv) or argv[index].startswith('--'):
+        print('usage: m3u8dl.exe --sniff <page_url> [--seconds <n>] [--out <json>] [--headed]')
+        return 2
+    page_url = argv[index]
+    index += 1
+
+    # 残りの引数を --key value 形式で読む (値を持たないフラグは空文字)
+    options: dict[str, str] = {}
+    while index < len(argv):
+        name = argv[index]
+        if name.startswith('--'):
+            value = ''
+            if index + 1 < len(argv) and not argv[index + 1].startswith('--'):
+                value = argv[index + 1]
+                index += 1
+            options[name] = value
+        index += 1
+
+    seconds = float(options.get('--seconds') or 25)
+    out_path = Path(options.get('--out') or 'sniff.json')
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 検出結果を URL で重複排除して蓄積する (同じ URL が何度も来るため)
+    detected: dict[str, dict[str, object]] = {}
+    log_lines: list[str] = []
+
+    def on_request(request) -> None:  # type: ignore[no-untyped-def]
+        """検出したリクエストを記録する。
+
+        Args:
+            request: SniffedRequest。
+        """
+        if request.url in detected:
+            return
+        detected[request.url] = {
+            'url': request.url,
+            'kind': request.kind,
+            'resource_type': request.resource_type,
+            'method': request.method,
+            'status': request.status,
+        }
+        log_lines.append(f'[detected] {request.kind} ({request.resource_type}): {request.url}')
+
+    def on_status(message: str) -> None:
+        """進捗メッセージを記録する。
+
+        Args:
+            message: ブラウザ側から届いた状態メッセージ。
+        """
+        log_lines.append(f'[status] {message}')
+
+    sniffer = BrowserSniffer(
+        on_request=on_request,
+        on_status=on_status,
+        headless='--headed' not in options,
+    )
+    report: dict[str, object] = {'page_url': page_url, 'seconds': seconds, 'ok': False}
+    try:
+        sniffer.start(page_url)
+        time_module.sleep(seconds)
+        report['browser'] = sniffer.get_browser_path()
+        report['title'] = sniffer.get_page_title()
+        report['ok'] = True
+    except (M3U8DLError, OSError, ValueError) as exc:
+        report['error'] = str(exc)
+    finally:
+        try:
+            sniffer.stop()
+        except Exception:
+            # 停止時の例外は検証結果に影響しないため握りつぶす
+            pass
+
+    report['detected'] = list(detected.values())
+    report['playlists'] = [item for item in detected.values() if item['kind'] == 'playlist']
+    report['log'] = log_lines[-80:]
+    out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f'[m3u8dl] sniff report: {out_path}')
+    return 0 if report.get('ok') and report['playlists'] else 1
+
+
 def main() -> int:
     """アプリケーションを起動する。
 
@@ -198,6 +297,10 @@ def main() -> int:
     # 画面なしのダウンロード (バッチ実行と exe の実動作検証用)
     if '--download' in sys.argv:
         return _run_cli_download(sys.argv)
+
+    # 画面なしのブラウザ解析 (exe のブラウザ解析経路の実動作検証用)
+    if '--sniff' in sys.argv:
+        return _run_cli_sniff(sys.argv)
 
     # 自己テストモード: GUI を出さずに結合検証だけ行い JSON を書き出す
     if '--selftest' in sys.argv:

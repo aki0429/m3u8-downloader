@@ -10,6 +10,7 @@ from __future__ import annotations
 import http.server
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -245,6 +246,86 @@ class TestBrowserSnifferLifecycle(unittest.TestCase):
         self.assertFalse(sniffer.is_running(), 'stop 後も is_running() が True')
         self.assertIsNone(sniffer._proc, 'stop 後もプロセス参照が残っている')
         self.assertFalse(_port_alive(debug_port), 'stop 後もデバッグポートが生きている')
+
+
+class TestBrowserFailureDiagnostics(unittest.TestCase):
+    """ブラウザ起動失敗時の診断情報とフォールバックの検証。"""
+
+    def test_wait_for_debugger_reports_exit_code_and_log(self) -> None:
+        """ブラウザが即終了したとき、終了コードと起動ログの末尾がメッセージに含まれること。"""
+
+        class _FakeProc:
+            """即座に終了したブラウザプロセスの代役。"""
+
+            returncode = 3
+
+            def poll(self) -> int:
+                """終了済みとして終了コードを返す。"""
+                return 3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / 'launch.log'
+            log_path.write_text('boom: cannot create profile', encoding='utf-8')
+
+            sniffer = BrowserSniffer(on_request=lambda request: None)
+            sniffer._proc = _FakeProc()  # type: ignore[assignment]
+            sniffer._launch_log = log_path
+            try:
+                with self.assertRaises(BrowserError) as context:
+                    sniffer._wait_for_debugger(0)
+            finally:
+                sniffer._proc = None
+
+            message = str(context.exception)
+            self.assertIn('exit code=3', message)
+            self.assertIn('boom: cannot create profile', message)
+
+    def test_start_reports_every_candidate(self) -> None:
+        """すべての候補で失敗したとき、候補ごとの理由がまとめて報告されること。"""
+        import m3u8dl.browser as browser_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 「実在するが実行できないファイル」を候補にして起動失敗を再現する
+            broken = Path(tmp) / 'broken_browser.exe'
+            broken.write_text('not an executable', encoding='utf-8')
+            original = browser_module._browser_candidates
+            browser_module._browser_candidates = lambda: [str(broken)]
+            try:
+                sniffer = BrowserSniffer(on_request=lambda request: None)
+                with self.assertRaises(BrowserError) as context:
+                    sniffer.start('about:blank')
+            finally:
+                browser_module._browser_candidates = original
+                sniffer.stop()
+
+            message = str(context.exception)
+            self.assertIn('broken_browser.exe', message)
+            self.assertIn('ブラウザ解析を開始できませんでした', message)
+
+    def test_falls_back_to_next_available_browser(self) -> None:
+        """1 つ目の候補が起動できなくても、次の候補で解析が開始されること。"""
+        import m3u8dl.browser as browser_module
+
+        available = [path for path in browser_module._browser_candidates() if os.path.isfile(path)]
+        if not available:
+            self.skipTest('対応ブラウザが見つからないためスキップ')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / 'missing_browser.exe'
+            original = browser_module._browser_candidates
+            # 1 つ目は存在しないパス、2 つ目に実在するブラウザを並べる
+            browser_module._browser_candidates = lambda: [str(missing), available[0]]
+            server, port = _start_server()
+            sniffer = BrowserSniffer(on_request=lambda request: None, headless=True)
+            try:
+                sniffer.start(f'http://127.0.0.1:{port}/index.html')
+                self.assertTrue(sniffer.is_running(), 'フォールバック後に解析が開始されていない')
+                self.assertEqual(sniffer.get_browser_path(), available[0])
+            finally:
+                browser_module._browser_candidates = original
+                sniffer.stop()
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == '__main__':

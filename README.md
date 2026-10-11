@@ -10,7 +10,7 @@ Cookie を使ったダウンロード、AES-128 で暗号化されたストリ�
 
 | 機能 | 説明 |
 | --- | --- |
-| ブラウザ解析 (m3u8 自動検出) | 内蔵の Chrome/Edge を CDP (Chrome DevTools Protocol) で制御し、ページが読み込む `.m3u8` / `.mp4` / `.ts` / `.key` を一覧表示します。動画を再生すると実際のストリーム URL が検出されます |
+| ブラウザ解析 (m3u8 自動検出) | 内蔵の Chrome/Edge/Brave を CDP (Chrome DevTools Protocol) で制御し、ページが読み込む `.m3u8` / `.mp4` / `.ts` / `.key` を一覧表示します。動画を再生すると実際のストリーム URL が検出されます。起動できなかったブラウザは自動で次の候補 (Chrome → Edge → Brave) に切り替えます |
 | Cookie を使った DL | 手貼り付け (`a=1; b=2`)、Netscape 形式の `cookies.txt`、JSON 形式のいずれか、または**解析中のブラウザから直接取得**した Cookie を送信します |
 | 並列ダウンロード | セグメントを同時接続数 (既定 8) で並列取得。リトライ (既定 3 回・指数バックオフ) つき |
 | AES-128 復号 | `#EXT-X-KEY:METHOD=AES-128` のセグメントを復号 (IV 省略時はメディアシーケンスから生成)。`SAMPLE-AES` (DRM 相当) は非対応 |
@@ -78,10 +78,21 @@ exe の動作確認:
 rem 画面を出さずに結合検証 (exe 検証用)
 dist\m3u8dl.exe --selftest "%TEMP%\m3u8dl_selftest.json"
 
+rem 画面を出さずにブラウザ解析だけを実行 (検出した URL を JSON に書き出す)
+dist\m3u8dl.exe --sniff "https://hls-js.netlify.app/demo/" --seconds 20 --out sniff.json
+
 rem 画面を出さずにダウンロード (バッチ実行にも使える)
 dist\m3u8dl.exe --download "https://example.com/playlist.m3u8" "C:\Users\me\Downloads\out.mp4" ^
   --cookie "a=1; b=2" --referer "https://example.com/watch" --concurrency 8
 ```
+
+`--sniff` のオプション:
+
+| オプション | 説明 |
+| --- | --- |
+| `--seconds <n>` | 解析する秒数 (既定 25) |
+| `--out <json>` | 結果の JSON の出力先 (既定 `sniff.json`) |
+| `--headed` | ヘッドレスではなく実際にウィンドウを表示して解析する |
 
 `--download` のオプション:
 
@@ -109,9 +120,20 @@ m3u8dl/
   crypto_aes.py        AES-128-CBC 復号
   cookies.py           Cookie の解釈・変換・保存
   errors.py            例外定義
-main.py                エントリポイント (--selftest / --version)
+main.py                エントリポイント (--selftest / --sniff / --download / --version)
 INTERFACES.md          モジュール間インターフェース契約
 ```
+
+## トラブルシューティング
+
+### 「ブラウザが起動直後に終了しました」と出る
+
+解析用ブラウザ (Chrome / Edge / Brave) が起動直後に終了しています。ツールは自動で次の候補ブラウザへ切り替えるため、この表示が出るときは**すべての候補ブラウザで失敗**しています。原因の切り分けは以下で行えます。
+
+- エラーメッセージに終了コードと、ブラウザ自身の出力の末尾がそのまま表示されます。
+- ブラウザの起動ログは `%TEMP%\m3u8dl_browser_launch.log` に追記されます (起動引数とブラウザの出力)。
+- Chrome / Edge が**自動更新の適用待ち**の状態だと起動直後に終了することがあります。ブラウザを手動で起動して更新を終わらせてから再試行してください。
+- Brave など一部のブラウザはセキュリティポリシーでリモートデバッグが禁止されていることがあります。その場合は別のブラウザ (Chrome など) をインストールしてください。
 
 ## 制約事項
 

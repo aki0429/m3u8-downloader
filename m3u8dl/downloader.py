@@ -727,11 +727,13 @@ class HLSDownloader:
             DownloadError: ffmpeg の実行または結合に失敗したとき。
         """
         list_path = self._segment_dir / 'concat_list.txt'
-        lines = [f"file '{part.as_posix()}'" for part in parts]
+        # concat リスト内の相対パスは「リストファイルのあるディレクトリ」基準で解釈されるため、
+        # カレントディレクトリからの相対指定で出力したときに二重パスにならないよう絶対パスで書く
+        lines = [f"file '{part.resolve().as_posix()}'" for part in parts]
         list_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        command = [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', str(list_path), '-c', 'copy']
+        command = [ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', str(list_path.resolve()), '-c', 'copy']
         if merge_format == 'mp4':
             # mp4 は AAC を ADTS から ASC へ変換する必要がある (ts 出力では付けない)
             command.extend(['-bsf:a', 'aac_adtstoasc'])
@@ -818,6 +820,8 @@ class HLSDownloader:
         suffix = '.mp4' if merge_format == 'mp4' else '.ts'
         target = self.options.output_path.with_suffix(suffix)
         ffmpeg = self._resolve_ffmpeg()
+        # ffmpeg が「無かった」のか「失敗した」のかを区別してメッセージに出すためフラグで覚える
+        ffmpeg_failed = False
 
         if ffmpeg is not None:
             try:
@@ -827,6 +831,7 @@ class HLSDownloader:
                 return target
             except DownloadError as error:
                 # ffmpeg が使えない場合はバイナリ結合へフォールバックする
+                ffmpeg_failed = True
                 self._log(f'ffmpeg での結合に失敗しました。バイナリ結合にフォールバックします: {error}')
         else:
             self._log('ffmpeg が見つからないためバイナリ結合で保存します')
@@ -834,7 +839,8 @@ class HLSDownloader:
         # フォールバック: mp4 指定でも拡張子は .ts になる
         fallback = self.options.output_path.with_suffix('.ts')
         if suffix == '.mp4':
-            self._log(f'mp4 指定でしたが ffmpeg が使えないため .ts として保存します: {fallback.name}')
+            reason = 'ffmpeg での結合に失敗したため' if ffmpeg_failed else 'ffmpeg が見つからないため'
+            self._log(f'mp4 指定でしたが{reason} .ts として保存します: {fallback.name}')
         result = self._concat_binary(parts, fallback)
         self._emit('done', f'保存しました: {result}')
         return result

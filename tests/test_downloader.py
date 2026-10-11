@@ -6,7 +6,9 @@ ffmpeg を使う実際の結合は実 TS が必要なため別担当の領域と
 ffmpeg 不在時のバイナリ結合フォールバックのみを確認する。
 """
 
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -675,6 +677,69 @@ class TestFfmpegAvailable(unittest.TestCase):
             options = DownloadOptions(output_path=Path(tmp) / 'out.mp4', ffmpeg_path=found)
             downloader = HLSDownloader(options)
             self.assertEqual(downloader._resolve_ffmpeg(), found)
+
+
+class TestFfmpegConcatList(unittest.TestCase):
+    """ffmpeg に渡す concat リストのパスが絶対パスで書かれることを検証する。"""
+
+    def test_concat_list_uses_absolute_paths(self) -> None:
+        """カレントディレクトリ相対の出力指定でも、リスト内と -i が絶対パスになること。
+
+        相対パスで書くと ffmpeg が「リストファイルのあるディレクトリ基準」で解釈し、
+        パスが二重になって結合に失敗する (実測で発生した不具合の再発防止)。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                # 相対パスの作業ディレクトリとセグメントを実際に作る
+                segment_dir = Path('sub') / 'out_segments'
+                segment_dir.mkdir(parents=True)
+                parts = []
+                for index in range(3):
+                    part = segment_dir / f'seg_{index:06d}.part'
+                    part.write_bytes(bytes([index]) * 16)
+                    parts.append(part)
+
+                options = DownloadOptions(output_path=Path('sub') / 'out.mp4', ffmpeg_path='ffmpeg')
+                downloader = HLSDownloader(options)
+                downloader._segment_dir = segment_dir
+
+                captured: dict[str, list[str]] = {}
+
+                def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+                    """ffmpeg を実行せずにコマンドだけ記録する。
+
+                    Args:
+                        command: 実行コマンド。
+                        **kwargs: 実行オプション (未使用)。
+
+                    Returns:
+                        成功を表す CompletedProcess。
+                    """
+                    captured['command'] = list(command)
+                    return subprocess.CompletedProcess(command, 0, b'', b'')
+
+                real_run = subprocess.run
+                subprocess.run = fake_run  # type: ignore[assignment]
+                try:
+                    downloader._merge_with_ffmpeg('ffmpeg', parts, Path('sub') / 'out.mp4', 'mp4')
+                finally:
+                    subprocess.run = real_run  # type: ignore[assignment]
+
+                lines = (segment_dir / 'concat_list.txt').read_text(encoding='utf-8').strip().splitlines()
+                self.assertEqual(len(lines), 3)
+                for line in lines:
+                    listed = line[len("file '"):-1]
+                    self.assertTrue(Path(listed).is_absolute(), f'絶対パスではありません: {line}')
+                    self.assertTrue(Path(listed).exists(), f'実在しないパスです: {line}')
+
+                command = captured['command']
+                list_argument = command[command.index('-i') + 1]
+                self.assertTrue(Path(list_argument).is_absolute(), f'-i が絶対パスではありません: {list_argument}')
+            finally:
+                # カレントディレクトリが一時ディレクトリ内だと Windows では削除できないため必ず戻す
+                os.chdir(previous_cwd)
 
 
 if __name__ == '__main__':

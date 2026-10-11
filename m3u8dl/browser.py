@@ -60,20 +60,28 @@ _BROWSER_CREATION_FLAGS_FALLBACK = (
 ) if os.name == 'nt' else 0
 
 
-def _launch_variants() -> list[tuple[str, tuple[str, ...]]]:
+def _launch_variants(headless_requested: bool = False) -> list[tuple[str, tuple[str, ...]]]:
     """ブラウザの起動引数のバリエーションを試行順に返す。
 
-    1 つ目の「既定」で失敗した場合に備え、サンドボックスを無効化した起動も試せるようにしている。
+    1 つ目の「既定」で失敗した場合に備え、別の起動方法も試せるようにしている。
     セキュリティ製品や制限された実行環境では、既定の起動が何も出力せずに即終了することがある。
+    特に「画面ありの起動だけが失敗する」環境 (デスクトップに接続できないセッション・管理者権限での
+    起動など) があるため、画面ありで起動するときはヘッドレスでも試す。ヘッドレスでも検出は同じように動く。
+
+    Args:
+        headless_requested: True のときは既にヘッドレスなので、ヘッドレスのバリエーションは足さない。
 
     Returns:
         (表示名, 追加引数) のリスト (試行順)。
     """
-    return [
-        ('既定', ()),
-        # 専用の一時プロファイルしか使わないため、フォールバックとしての影響は限定的
-        ('sandbox 無効', ('--no-sandbox', '--disable-gpu')),
-    ]
+    variants: list[tuple[str, tuple[str, ...]]] = [('既定', ())]
+    if not headless_requested:
+        variants.append(('ヘッドレス', ('--headless=new',)))
+    # 専用の一時プロファイルしか使わないため、フォールバックとしての影響は限定的
+    variants.append(('sandbox 無効', ('--no-sandbox', '--disable-gpu')))
+    if not headless_requested:
+        variants.append(('ヘッドレス + sandbox 無効', ('--headless=new', '--no-sandbox', '--disable-gpu')))
+    return variants
 
 
 @dataclass
@@ -280,7 +288,7 @@ class BrowserSniffer:
         attempts = [
             (candidate, variant, extra_arguments)
             for candidate in candidates
-            for variant, extra_arguments in _launch_variants()
+            for variant, extra_arguments in _launch_variants(self._headless)
         ]
         for index, (candidate, variant, extra_arguments) in enumerate(attempts):
             try:

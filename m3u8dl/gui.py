@@ -261,7 +261,11 @@ class DownloaderApp:
         self.stop_analyze_button = ttk.Button(frame, text='解析停止', command=self._on_stop_analysis)
         self.stop_analyze_button.grid(row=0, column=2, padx=(4, 8), pady=6)
 
-        self.lockable_widgets += [self.url_entry, self.analyze_button, self.stop_analyze_button]
+        # ブラウザを起動できない環境向け: ページの内容から m3u8 の URL を直接探す
+        self.scan_button = ttk.Button(frame, text='URL を抽出', command=self._on_scan_page)
+        self.scan_button.grid(row=0, column=3, padx=(0, 8), pady=6)
+
+        self.lockable_widgets += [self.url_entry, self.analyze_button, self.stop_analyze_button, self.scan_button]
 
     def _build_result_tree(self) -> None:
         """検出結果を表示する Treeview を構築する。"""
@@ -558,7 +562,72 @@ class DownloaderApp:
             sniffer.start(page_url)
             self.log('ブラウザ解析を実行中です。ページを操作して動画を再生してください。')
         except Exception as exc:
+            # ブラウザを起動できない環境では、ページの内容から URL を直接探して最低限の結果を返す
+            self.log('ブラウザで解析できないため、ページの内容から URL を直接探します...')
+            self._scan_fallback(page_url, headers)
             self.root.after(0, self._handle_exception, 'ブラウザ解析', exc)
+
+    def _on_scan_page(self) -> None:
+        """「URL を抽出」ボタンのハンドラ (ブラウザを使わずに URL を探す)。"""
+        url = self.url_var.get().strip()
+        if not url:
+            self._append_log('URL を入力してください。')
+            return
+        headers = self._build_headers()
+        # 連打でスレッドが増えないように、探索の間はボタンを無効化する
+        self.scan_button.configure(state='disabled')
+        threading.Thread(target=self._run_scan, args=(url, headers), daemon=True).start()
+
+    def _run_scan(self, page_url: str, headers: dict[str, str]) -> None:
+        """ページの内容から m3u8 の URL を探す (ワーカースレッド)。
+
+        Args:
+            page_url: 探索するページの URL。
+            headers: 取得に使うヘッダのスナップショット。
+        """
+        try:
+            self.log(f'ブラウザを使わずに URL を探します: {page_url}')
+            self._scan_fallback(page_url, headers)
+        finally:
+            self.root.after(0, lambda: self.scan_button.configure(state='normal'))
+
+    def _scan_fallback(self, page_url: str, headers: dict[str, str]) -> None:
+        """ページとその JavaScript から m3u8 の URL を探して一覧に追加する。
+
+        ブラウザを起動できない環境 (リモートデバッグの禁止・管理者権限での起動の影響・
+        セキュリティ製品など) でも結果を出せるようにするためのフォールバック。
+
+        Args:
+            page_url: 探索するページの URL。
+            headers: 取得に使うヘッダのスナップショット。
+        """
+        from m3u8dl.scan import scan_page_for_playlists
+
+        try:
+            result = scan_page_for_playlists(page_url, headers=headers)
+        except Exception as exc:
+            self.log(f'ページの内容からの探索に失敗しました: {exc}')
+            return
+        for error in result.errors[:3]:
+            self.log(f'取得に失敗しました: {error}')
+        if not result.playlists:
+            self.log('ページの内容からは URL を見つけられませんでした (JavaScript が URL を組み立てるサイトでは見つかりません)。')
+            return
+        for playlist in result.playlists:
+            self.log(f'ページの内容から見つけました: {playlist}')
+            self.root.after(0, self._register_playlist, playlist, headers)
+
+    def _register_playlist(self, url: str, headers: dict[str, str]) -> None:
+        """見つけたプレイリストを一覧へ追加し、種別の判定を始める (メインスレッド)。
+
+        Args:
+            url: プレイリスト URL。
+            headers: プレイリスト取得に使うヘッダのスナップショット。
+        """
+        self._add_tree_row('playlist', url, None)
+        if url not in self.probed_playlists:
+            self.probed_playlists.add(url)
+            threading.Thread(target=self._probe_playlist, args=(url, headers), daemon=True).start()
 
     def _on_stop_analysis(self) -> None:
         """「解析停止」ボタンのハンドラ。"""

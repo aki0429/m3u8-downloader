@@ -231,6 +231,10 @@ class HLSDownloader:
         else:
             parts = self._download_segments(segments)
 
+        # fMP4 (EXT-X-MAP あり) の初期化セグメントは必ず先頭に置く
+        # (ライブ収録と VOD で同じ並びになるよう、ここで一括して前置する)
+        if self._init_part is not None:
+            parts = [self._init_part, *parts]
         self._ordered_parts = parts
         return self._merge()
 
@@ -603,9 +607,6 @@ class HLSDownloader:
             executor.shutdown(wait=True, cancel_futures=True)
 
         parts = [part for part in ordered if part is not None]
-        if self._init_part is not None:
-            # 初期化セグメントは必ず先頭に置く
-            parts = [self._init_part, *parts]
         return parts
 
     def _interruptible_sleep(self, seconds: float) -> None:
@@ -809,6 +810,18 @@ class HLSDownloader:
 
         merge_format = (self.options.merge_format or 'mp4').lower()
         self._emit('merge', 'ファイルを結合しています')
+
+        # fMP4 (EXT-X-MAP あり) は各セグメントが単体では解析できない断片 (.m4s) のため、
+        # ffmpeg の concat デマルチプレクサでは結合できない (no tfhd エラーになる)。
+        # 初期化セグメント + フラグメントのバイナリ結合がそのまま有効な mp4 になるので、それで保存する。
+        if self._init_part is not None:
+            if merge_format == 'ts':
+                # 中身は mp4 なので、拡張子だけ .ts にすると再生機器を混乱させる
+                self._log(f'fMP4 (初期化セグメントあり) のため .ts ではなく .mp4 として保存します: {self.options.output_path.with_suffix(".mp4").name}')
+            target = self.options.output_path.with_suffix('.mp4')
+            result = self._concat_binary(parts, target)
+            self._emit('done', f'保存しました: {result}')
+            return result
 
         # 'none' は ffmpeg を使わずバイナリ結合のみ (.ts として保存する)
         if merge_format == 'none':

@@ -68,6 +68,8 @@ py -3.12 -m unittest discover -s tests -p "test_*.py" -v
 - `test_cookies.py` — Cookie の各形式の解釈と変換
 - `test_downloader.py` — ローカル HTTP サーバーに対する並列 DL・リトライ・AES 復号・キャンセル・部分取得
 - `test_integration_local_hls.py` — ffmpeg で生成した実 HLS (平文 / AES-128) を配信して end-to-end で検証
+- `test_integration_fmp4.py` — ffmpeg で生成した fMP4 (init.mp4 + .m4s) の HLS を配信し、mp4 出力・`--ts` 指定時の扱い・ライブ収録での初期化セグメントの扱いを検証
+- `test_scan.py` — ブラウザを使わない URL 探索 (HTML / JavaScript / 相対 URL / エラー時の扱い) と GUI のフォールバック経路
 - `test_gui_smoke.py` — GUI の起動スモークテスト
 - `test_gui_download_e2e.py` — GUI (DownloaderApp) の「ダウンロード開始」経路から mp4 が完成するまでの検証 (キャンセルも含む)
 - `test_gui_analysis_e2e.py` — GUI の「ブラウザで解析」経路でプレイリストとバリアントが一覧に反映され、停止できることの検証
@@ -86,6 +88,9 @@ dist\m3u8dl.exe --sniff "https://hls-js.netlify.app/demo/" --seconds 20 --out sn
 rem 使用するブラウザを指定して解析する (Chrome 以外での動作確認にも使える)
 dist\m3u8dl.exe --sniff "https://hls-js.netlify.app/demo/" --seconds 20 --out sniff_edge.json --browser edge
 
+rem ブラウザを使わずに、ページとその JavaScript から m3u8 の URL を探す
+dist\m3u8dl.exe --scan "https://example.com/watch/123" --out scan.json
+
 rem 「ブラウザで解析」が始まらない環境の切り分けレポートを書き出す
 dist\m3u8dl.exe --diagnose "%USERPROFILE%\Desktop\m3u8dl_diagnose.txt"
 
@@ -102,6 +107,13 @@ dist\m3u8dl.exe --download "https://example.com/playlist.m3u8" "C:\Users\me\Down
 | `--out <json>` | 結果の JSON の出力先 (既定 `sniff.json`) |
 | `--headed` | ヘッドレスではなく実際にウィンドウを表示して解析する |
 | `--browser <name\|path>` | 使用するブラウザを指定する (`chrome` / `edge` / `brave`、または実行ファイルのパス)。省略時は Chrome → Edge → Brave の順に自動で試す |
+
+`--scan` のオプション:
+
+| オプション | 説明 |
+| --- | --- |
+| `--out <json>` | 結果の JSON の出力先 (既定 `scan.json`) |
+| `--cookie <text\|file>` / `--referer <url>` / `--user-agent <ua>` | 取得に使うヘッダ |
 
 `--download` のオプション:
 
@@ -123,13 +135,14 @@ dist\m3u8dl.exe --download "https://example.com/playlist.m3u8" "C:\Users\me\Down
 m3u8dl/
   gui.py               tkinter GUI (エントリポイント)
   browser.py           Chrome / Edge / Brave を CDP で制御して m3u8 を検出 / Cookie 取得
+  scan.py              ブラウザを使わずにページと JavaScript から m3u8 の URL を探す (フォールバック)
   websocket_client.py  RFC6455 の WebSocket クライアント (CDP 通信用・自前実装)
   downloader.py        セグメント並列取得・リトライ・復号・結合・ライブ収録
   hls.py               プレイリスト (マスター/メディア) の解析
   crypto_aes.py        AES-128-CBC 復号
   cookies.py           Cookie の解釈・変換・保存
   errors.py            例外定義
-main.py                エントリポイント (--selftest / --sniff / --diagnose / --download / --version)
+main.py                エントリポイント (--selftest / --sniff / --scan / --diagnose / --download / --version)
 INTERFACES.md          モジュール間インターフェース契約
 ```
 
@@ -149,6 +162,12 @@ INTERFACES.md          モジュール間インターフェース契約
 - ブラウザの起動ログは `%TEMP%\m3u8dl_browser_launch.log` に追記されます (起動引数とブラウザの出力)。
 - Chrome / Edge が**自動更新の適用待ち**の状態だと起動直後に終了することがあります。ツールは起動プロセスが終了しても数秒間デバッグポートの応答を待ち、それでもだめならサンドボックスを無効化した起動も試します。ブラウザを手動で起動して更新を終わらせてから再試行すると確実です。
 - リモートデバッグがポリシーで禁止されている環境では、どのブラウザでも解析はできません。`--diagnose` のポリシー欄を確認し、ブラウザ側の設定 (またはシステム管理者) でリモートデバッグを許可するか、Cookie を貼り付けてのダウンロード機能を使ってください。
+- 画面ありの起動だけが失敗する環境のために、起動に失敗すると**ヘッドレスでも自動的に再試行**します (ヘッドレスでも検出は同じように動きます)。
+- それでもブラウザが起動できない場合は、**ページの内容から URL を直接探すフォールバック**が動きます。GUI では「ブラウザで解析」の失敗時に自動で実行され、ボタン「URL を抽出」で単独実行もできます。コマンドラインでは `--scan` です。ページの HTML と参照している JavaScript に書かれた `.m3u8` を拾うだけなので、JavaScript が URL を組み立てるサイトでは見つかりません。
+
+  ```bat
+  dist\m3u8dl.exe --scan "https://example.com/watch/123" --out scan.json
+  ```
 
 ### バリアント (画質) の URL が 404 になる
 
@@ -157,6 +176,7 @@ INTERFACES.md          モジュール間インターフェース契約
 ## 制約事項
 
 - `SAMPLE-AES` (Widevine / FairPlay などの DRM が前提の方式) には対応しません。
+- fMP4 (`#EXT-X-MAP` あり) の配信は、各セグメントが単体では解析できない断片のため、セグメントをまとめて mp4 として保存します (`--ts` を指定しても `.mp4` になります)。
 - フェアユースの範囲 (私的利用・保存が許可されているコンテンツ) でのみ使用してください。各サービスの利用規約と著作権法を確認し、権利者の許諾が必要なコンテンツのダウンロードには使用しないでください。
 - 純 Python の AES 実装にフォールバックした場合は復号が非常に遅くなります (同梱の exe は pycryptodome を同梱しているため高速です)。
 

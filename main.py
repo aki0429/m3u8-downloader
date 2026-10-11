@@ -319,6 +319,65 @@ def _run_cli_sniff(argv: list[str]) -> int:
     return 0 if report.get('ok') and report['playlists'] else 1
 
 
+def _run_cli_scan(argv: list[str]) -> int:
+    """ブラウザを使わずにページの内容から m3u8 の URL を探して一覧を書き出す。
+
+    ブラウザを起動できない環境向けの補助モード。ページの HTML と参照している JavaScript を
+    取得して `.m3u8` の URL を拾うだけなので、JavaScript が URL を組み立てるサイトでは
+    見つからない (その場合はブラウザ解析が必要)。
+
+    Args:
+        argv: `--scan` 以降を含むコマンドライン引数。
+
+    Returns:
+        終了コード (0=見つかった, 1=見つからない, 2=引数エラー)。
+    """
+    from m3u8dl.scan import scan_page_for_playlists
+
+    index = argv.index('--scan') + 1
+    if index >= len(argv) or argv[index].startswith('--'):
+        print('usage: m3u8dl.exe --scan <page_url> [--out <json>] [--cookie <text|file>] [--referer <url>] [--user-agent <ua>]')
+        return 2
+    page_url = argv[index]
+    index += 1
+
+    options: dict[str, str] = {}
+    while index < len(argv):
+        name = argv[index]
+        if name.startswith('--'):
+            value = ''
+            if index + 1 < len(argv) and not argv[index + 1].startswith('--'):
+                value = argv[index + 1]
+                index += 1
+            options[name] = value
+        index += 1
+
+    out_path = Path(options.get('--out') or 'scan.json')
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = _build_cli_headers(options)
+    report: dict[str, object] = {'page_url': page_url, 'ok': False}
+    try:
+        result = scan_page_for_playlists(page_url, headers=headers)
+    except (ValueError, OSError) as exc:
+        report['error'] = str(exc)
+        out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(f'[m3u8dl] scan report: {out_path}')
+        return 1
+
+    report['playlists'] = result.playlists
+    report['fetched_urls'] = result.fetched_urls
+    report['errors'] = result.errors
+    report['ok'] = bool(result.playlists)
+    out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f'[m3u8dl] scan report: {out_path}')
+    for playlist in result.playlists:
+        print(f'[m3u8dl] playlist: {playlist}')
+    if not result.playlists:
+        print('[m3u8dl] ページの内容からは URL を見つけられませんでした')
+    return 0 if result.playlists else 1
+
+
 def _read_browser_policies() -> list[str]:
     """リモートデバッグを禁止しうるブラウザのグループポリシーを読み出す (Windows のみ)。
 
@@ -585,6 +644,10 @@ def main() -> int:
     # 画面なしのブラウザ解析 (exe のブラウザ解析経路の実動作検証用)
     if '--sniff' in sys.argv:
         return _run_cli_sniff(sys.argv)
+
+    # ブラウザを使わずにページの内容から m3u8 の URL を探す (それでも取れない環境向け)
+    if '--scan' in sys.argv:
+        return _run_cli_scan(sys.argv)
 
     # ブラウザ解析が始められない環境の切り分けレポート (結果はファイルへ書き出す)
     if '--diagnose' in sys.argv:
